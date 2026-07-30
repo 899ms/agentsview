@@ -492,11 +492,7 @@ func (db *DB) activityReportUsage(
 		if !mask[i] {
 			continue
 		}
-		_, outputTok, _, _, _, _, priceErr :=
-			dailyUsageAmounts(o.scan, rateResolver)
-		if priceErr != nil {
-			return nil, nil, priceErr
-		}
+		_, outputTok, _, _, _ := dailyUsageRowTokens(o.scan)
 		costRow := o.scan
 		var sessionCost *money.Money
 		if o.scan.costSource == CopilotReportedCostSource && o.scan.cost.Valid {
@@ -559,12 +555,23 @@ func sqliteActivityReportRowStatus(
 		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
 		return money.Money{}, false, true, nil
 	}
-	cost, err = lookup.Rates.CostForTokens(
+	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	cost, err = lookup.Rates.CostForTokensScoped(
+		requestScoped,
 		inTok, outTok, reasoningTok, crTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing activity usage for model %q: %w", r.model, err)
 	}
-	pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
+	recordComputedUsagePricing(
+		pricing,
+		r.model,
+		pricedModel,
+		lookup,
+		requestScoped,
+		inTok,
+		crTok,
+		rdTok,
+	)
 	return cost, true, true, nil
 }

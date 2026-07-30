@@ -415,6 +415,29 @@ var mirrorTables = []tableSpec{
 		},
 	},
 	{
+		name: "model_pricing_bands",
+		create: `CREATE TABLE IF NOT EXISTS model_pricing_bands (
+			model_pattern TEXT NOT NULL,
+			above_input_tokens BIGINT NOT NULL,
+			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (model_pattern, above_input_tokens),
+			FOREIGN KEY (model_pattern) REFERENCES model_pricing(model_pattern)
+		)`,
+		columns: []columnSpec{
+			{"model_pattern", "model_pattern TEXT"},
+			{"above_input_tokens", "above_input_tokens BIGINT NOT NULL"},
+			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
+		},
+	},
+	{
 		name: "source_project_identity_observations",
 		create: `CREATE TABLE IF NOT EXISTS source_project_identity_observations (
 			source_archive_id TEXT NOT NULL DEFAULT '',

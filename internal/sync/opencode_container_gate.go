@@ -5,6 +5,7 @@ package sync
 import (
 	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -99,28 +100,9 @@ func (e *Engine) captureSQLiteContainerStates(
 		return nil
 	}
 	states := make(map[string]parser.SQLiteContainerState)
-	addState := func(agent parser.AgentType, dbPath string) {
-		if dbPath == "" {
-			return
-		}
-		if _, seen := states[dbPath]; seen {
-			return
-		}
-		state, ok := statSQLiteContainerState(dbPath)
-		if !ok {
-			return
-		}
-		states[dbPath] = state
-	}
 	if len(changedPaths) == 0 {
 		for _, agent := range openCodeFamilySQLiteAgents {
-			for _, dir := range e.agentDirs[agent] {
-				if dir == "" || strings.HasPrefix(dir, "s3://") {
-					continue
-				}
-				src := resolveOpenCodeFormatSource(agent, filepath.Clean(dir))
-				addState(agent, src.DBPath)
-			}
+			e.captureAgentSQLiteContainerStates(agent, nil, states)
 		}
 		return states
 	}
@@ -131,11 +113,88 @@ func (e *Engine) captureSQLiteContainerStates(
 				if dir == "" || strings.HasPrefix(dir, "s3://") {
 					continue
 				}
-				addState(agent, openCodeContainerPathForEvent(agent, dir, path))
+				addSQLiteContainerState(
+					states, openCodeContainerPathForEvent(agent, dir, path),
+				)
 			}
 		}
 	}
 	return states
+}
+
+// captureSQLiteContainerStatesForAgent scopes the pre-discovery capture to
+// what an agent-scoped pass can discover. A pass scoped to a provider outside
+// the OpenCode SQLite family streams no shared containers, so probing every
+// configured container there would repeat once per provider group in a
+// grouped poll; an in-family scope probes only its own containers that
+// overlap the pass's reconciliation roots, keeping capture work bounded by
+// the batch rather than the agent's full configuration. The unscoped pass
+// (empty agent) still captures every configured container.
+func (e *Engine) captureSQLiteContainerStatesForAgent(
+	agent parser.AgentType, roots []string,
+) map[string]parser.SQLiteContainerState {
+	if agent == "" {
+		return e.captureSQLiteContainerStates(nil)
+	}
+	if e.forceParse || !slices.Contains(openCodeFamilySQLiteAgents, agent) {
+		return nil
+	}
+	states := make(map[string]parser.SQLiteContainerState)
+	e.captureAgentSQLiteContainerStates(agent, roots, states)
+	return states
+}
+
+// captureAgentSQLiteContainerStates captures one agent's containers. Non-nil
+// roots restrict the capture to configured dirs overlapping them; nil roots
+// capture every configured dir (full and changed-path passes).
+func (e *Engine) captureAgentSQLiteContainerStates(
+	agent parser.AgentType,
+	roots []string,
+	states map[string]parser.SQLiteContainerState,
+) {
+	for _, dir := range e.agentDirs[agent] {
+		if dir == "" || strings.HasPrefix(dir, "s3://") {
+			continue
+		}
+		if !containerDirOverlapsRoots(dir, roots) {
+			continue
+		}
+		src := resolveOpenCodeFormatSource(agent, filepath.Clean(dir))
+		addSQLiteContainerState(states, src.DBPath)
+	}
+}
+
+// containerDirOverlapsRoots mirrors logicalRootsForAgentWatchRoots's
+// bidirectional overlap so the capture covers exactly the configured dirs a
+// scoped pass can expand into: a dir is capturable when it is the same path
+// as, an ancestor of, or a descendant of any reconciliation root. Empty
+// roots match everything.
+func containerDirOverlapsRoots(dir string, roots []string) bool {
+	if len(roots) == 0 {
+		return true
+	}
+	cleanedDir := cleanRootPath(dir)
+	return slices.ContainsFunc(roots, func(root string) bool {
+		cleanedRoot := cleanRootPath(root)
+		return samePathOrDescendant(cleanedRoot, cleanedDir) ||
+			samePathOrDescendant(cleanedDir, cleanedRoot)
+	})
+}
+
+func addSQLiteContainerState(
+	states map[string]parser.SQLiteContainerState, dbPath string,
+) {
+	if dbPath == "" {
+		return
+	}
+	if _, seen := states[dbPath]; seen {
+		return
+	}
+	state, ok := statSQLiteContainerState(dbPath)
+	if !ok {
+		return
+	}
+	states[dbPath] = state
 }
 
 func openCodeContainerPathForEvent(

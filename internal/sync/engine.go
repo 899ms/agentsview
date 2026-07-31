@@ -43,6 +43,26 @@ var errSessionPreserved = errors.New("session preserved")
 type reconciliationMetricsContextKey struct{}
 type reconciliationBaselineContextKey struct{}
 type deferGlobalLinkContextKey struct{}
+type deferPassEpilogueContextKey struct{}
+
+// passEpilogueDeferred reports whether a grouped caller owns the pass
+// epilogue — global subagent linking and skip-cache persistence — so a
+// scoped reconciliation must not repeat that archive-sized work itself.
+func passEpilogueDeferred(ctx context.Context) bool {
+	deferred, _ := ctx.Value(deferPassEpilogueContextKey{}).(bool)
+	return deferred
+}
+
+// passEpilogueEligibility records, at the per-pass gate sites, whether a
+// pass would have run global subagent linking and skip-cache persistence.
+// Grouped callers consume it instead of inferring eligibility from the
+// pass's final error: that error also reflects later tombstoning and spool
+// cleanup failures, which never suppressed the per-pass epilogue and must
+// not suppress the shared one.
+type passEpilogueEligibility struct {
+	link    bool
+	persist bool
+}
 
 type reconciliationBaselineTracker struct {
 	sources     map[db.SessionSourcePath]struct{}
@@ -3269,9 +3289,113 @@ func (e *Engine) ReconcileProviderRoots(
 	return err
 }
 
+// ProviderRootsGroup pairs one provider with the roots of its bounded
+// scheduled pass. An empty Agent runs the unscoped local reconciliation path.
+type ProviderRootsGroup struct {
+	Agent parser.AgentType
+	Roots []string
+}
+
+// ReconcileProviderRootsGrouped runs the bounded scheduled pass for every
+// group and shares one pass epilogue — global subagent linking and skip-cache
+// persistence — across the whole batch, so a multi-provider poll performs
+// that archive-sized work once instead of once per provider. Every group is
+// attempted even when an earlier one fails; per-group failures are wrapped
+// with the provider and joined.
+//
+// syncMu is held across every group and the epilogue: releasing it between a
+// group and the deferred persistSkipCache would let a concurrent pass update
+// and persist newer skip state that the epilogue's snapshot then overwrites,
+// resurrecting removed entries after a restart. "sessions" emits happen after
+// the lock is released, coalesced into one event for the batch.
+//
+// Epilogue eligibility is recorded at each pass's own gate sites — after
+// page writes commit, before tombstoning and spool cleanup — so a later
+// tombstoning or cleanup failure in one group cannot leave successfully
+// synced sessions unlinked or the skip cache unpersisted, matching the
+// per-pass ordering exactly.
+func (e *Engine) ReconcileProviderRootsGrouped(
+	ctx context.Context, groups []ProviderRootsGroup,
+) error {
+	deferredCtx := context.WithValue(ctx, deferPassEpilogueContextKey{}, true)
+	var errs []error
+	changed := false
+	func() {
+		e.syncMu.Lock()
+		defer e.syncMu.Unlock()
+		linkEligible := false
+		persistEligible := false
+		for _, group := range groups {
+			if ctx.Err() != nil {
+				break
+			}
+			stats, tombstoned, eligibility, err := e.reconcileScopedWatchRootsLocked(
+				deferredCtx, group.Agent, group.Roots, false, false,
+			)
+			changed = changed || stats.Synced > 0 || tombstoned > 0
+			linkEligible = linkEligible || eligibility.link
+			persistEligible = persistEligible || eligibility.persist
+			if err == nil {
+				continue
+			}
+			agent := string(group.Agent)
+			if agent == "" {
+				agent = "unscoped"
+			}
+			errs = append(errs, fmt.Errorf("reconcile %s roots: %w", agent, err))
+		}
+		// A canceled batch skips the epilogue entirely: linking and skip-cache
+		// persistence are not context-aware, and shutdown must not block on
+		// archive-sized database work. In-memory skip promotions survive and
+		// persist on the next clean pass; the returned error keeps the batch
+		// from being mistaken for a completed one.
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"grouped reconciliation epilogue skipped: %w", err,
+			))
+			return
+		}
+		if linkEligible {
+			if err := e.linkSubagentSessions(ctx); err != nil {
+				errs = append(errs, fmt.Errorf(
+					"link subagent sessions after grouped reconciliation: %w", err,
+				))
+			}
+		}
+		if persistEligible {
+			e.persistSkipCache()
+		}
+	}()
+	if changed {
+		e.emit("sessions")
+	}
+	return errors.Join(errs...)
+}
+
 func (e *Engine) reconcileScopedWatchRoots(
 	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
 ) (SyncStats, int, error) {
+	stats, tombstoned, _, err := func() (SyncStats, int, passEpilogueEligibility, error) {
+		e.syncMu.Lock()
+		defer e.syncMu.Unlock()
+		return e.reconcileScopedWatchRootsLocked(ctx, agent, roots, full, force)
+	}()
+	// Emit outside syncMu so an Emitter implementation cannot widen the
+	// critical section or deadlock by re-entering sync code (see SyncAll).
+	if stats.Synced > 0 || tombstoned > 0 {
+		e.emit("sessions")
+	}
+	return stats, tombstoned, err
+}
+
+// reconcileScopedWatchRootsLocked is the scoped pass body. The caller holds
+// syncMu and is responsible for emitting "sessions" when the returned stats
+// or tombstone count report changes. The returned eligibility reflects the
+// per-pass epilogue gates so a deferring caller can run the shared epilogue
+// exactly when the pass itself would have.
+func (e *Engine) reconcileScopedWatchRootsLocked(
+	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
+) (SyncStats, int, passEpilogueEligibility, error) {
 	var logicalRoots []string
 	var excludedRemoteRoots int
 	if agent == "" {
@@ -3284,15 +3408,12 @@ func (e *Engine) reconcileScopedWatchRoots(
 			Complete: true,
 			Metrics:  ReconciliationMetrics{ExcludedRemoteRoots: excludedRemoteRoots},
 		})
-		return SyncStats{}, 0, nil
+		return SyncStats{}, 0, passEpilogueEligibility{}, nil
 	}
-	stats, metrics, tombstoned, err := e.reconcileWatchRootsStreamed(
+	stats, metrics, tombstoned, eligibility, err := e.reconcileWatchRootsStreamedLocked(
 		ctx, agent, logicalRoots, full, force,
 	)
 	metrics.ExcludedRemoteRoots = excludedRemoteRoots
-	if stats.Synced > 0 || tombstoned > 0 {
-		e.emit("sessions")
-	}
 	complete := err == nil && ctx.Err() == nil && !stats.Aborted &&
 		stats.Failed == 0 && stats.providerFailures == 0
 	if err == nil && !complete {
@@ -3304,7 +3425,7 @@ func (e *Engine) reconcileScopedWatchRoots(
 		ProviderFailures: stats.providerFailures,
 		Metrics:          metrics,
 	})
-	return stats, tombstoned, err
+	return stats, tombstoned, eligibility, err
 }
 
 // ReconcileWatchRootsAfterLostEvents is the watcher-overflow entrypoint. It is
@@ -3323,14 +3444,19 @@ func (e *Engine) ReconciliationRootsForAgent(agent string) []string {
 	return append([]string(nil), e.agentDirs[parser.AgentType(agent)]...)
 }
 
-func (e *Engine) reconcileWatchRootsStreamed(
+// reconcileWatchRootsStreamedLocked runs one streamed reconciliation pass.
+// The caller must hold syncMu: reconcileScopedWatchRoots takes it per pass,
+// and ReconcileProviderRootsGrouped holds it across every group plus the
+// shared epilogue so no other pass can interleave with a pending epilogue.
+func (e *Engine) reconcileWatchRootsStreamedLocked(
 	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
-) (stats SyncStats, metrics ReconciliationMetrics, tombstoned int, retErr error) {
+) (
+	stats SyncStats, metrics ReconciliationMetrics, tombstoned int,
+	eligibility passEpilogueEligibility, retErr error,
+) {
 	if err := ctx.Err(); err != nil {
-		return SyncStats{Aborted: true}, metrics, 0, err
+		return SyncStats{Aborted: true}, metrics, 0, eligibility, err
 	}
-	e.syncMu.Lock()
-	defer e.syncMu.Unlock()
 	if force {
 		e.clearWatcherOverflowCaches()
 	}
@@ -3347,7 +3473,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	ctx, closeProviderCache, err := parser.WithReconciliationCache(ctx)
 	if err != nil {
 		stats.Aborted = true
-		return stats, metrics, 0, err
+		return stats, metrics, 0, eligibility, err
 	}
 	defer func() {
 		if cleanupErr := closeProviderCache(); cleanupErr != nil {
@@ -3363,7 +3489,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	spool, err := e.reconciliationSpoolFactory(e.db.Path())
 	if err != nil {
 		stats.Aborted = true
-		return stats, metrics, 0, err
+		return stats, metrics, 0, eligibility, err
 	}
 	cleaned := false
 	defer func() {
@@ -3378,7 +3504,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	} else if scope != nil {
 		scope.agent = agent
 	}
-	preContainerStates := e.captureSQLiteContainerStates(nil)
+	preContainerStates := e.captureSQLiteContainerStatesForAgent(agent, roots)
 	providers, completedScopes, failedRoots,
 		failures, discoveryErr, err := e.streamReconciliationCandidates(
 		ctx, scope, spool,
@@ -3391,7 +3517,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 			err = errors.Join(err, cleanupErr)
 		}
 		cleaned = true
-		return stats, metrics, 0, err
+		return stats, metrics, 0, eligibility, err
 	}
 	authoritativeProviders := make(map[parser.AgentType]struct{}, len(completedScopes))
 	for _, completed := range completedScopes {
@@ -3496,7 +3622,14 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	// Page writes committed cleanly when the paging loop finished without an
 	// error or a failed write; provider discovery failures are layered on
 	// below and must not suppress work that only depends on committed writes.
+	// A grouped caller (passEpilogueDeferred) runs linking once after every
+	// group instead, consuming the eligibility recorded here; tombstoning
+	// below then proceeds without the linking gate, which is safe because
+	// linking is idempotent and retried on the caller's next pass.
 	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
+		eligibility.link = true
+	}
+	if eligibility.link && !passEpilogueDeferred(ctx) {
 		// Batch-level linking was deferred to this global pass, so run it
 		// whenever the committed page writes succeeded — including partial
 		// provider failures. Sessions from healthy providers are already in
@@ -3543,7 +3676,10 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		)
 	}
 	if retErr == nil {
-		e.persistSkipCache()
+		eligibility.persist = true
+		if !passEpilogueDeferred(ctx) {
+			e.persistSkipCache()
+		}
 		e.mu.Lock()
 		e.lastSync = time.Now()
 		e.lastSyncStats = stats
@@ -3574,7 +3710,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		retErr = errors.Join(retErr, cleanupErr)
 	}
 	cleaned = true
-	return stats, metrics, tombstoned, retErr
+	return stats, metrics, tombstoned, eligibility, retErr
 }
 
 func (e *Engine) tombstoneCompletedReconciliationScopesLocked(

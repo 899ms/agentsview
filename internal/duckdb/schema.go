@@ -15,8 +15,9 @@ import (
 // migrations between versions. A version mismatch means the mirror file
 // must be rebuilt with 'agentsview duckdb push --full'. v8 adds
 // sessions.source_archive_id and the source_worktree_project_mappings
-// mirror table on top of the schema-v7 mainline shape.
-const SchemaVersion = 8
+// mirror table on top of the schema-v7 mainline shape. v9 adds the
+// sessions.session_kind and messages.prompt_source columns.
+const SchemaVersion = 9
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -113,6 +114,7 @@ var mirrorTables = []tableSpec{
 			agent TEXT NOT NULL DEFAULT 'claude',
 			agent_label TEXT NOT NULL DEFAULT '',
 			entrypoint TEXT NOT NULL DEFAULT '',
+			session_kind TEXT NOT NULL DEFAULT '',
 			first_message TEXT,
 			display_name TEXT,
 			session_name TEXT,
@@ -183,6 +185,7 @@ var mirrorTables = []tableSpec{
 			{"agent", "agent TEXT NOT NULL DEFAULT 'claude'"},
 			{"agent_label", "agent_label TEXT NOT NULL DEFAULT ''"},
 			{"entrypoint", "entrypoint TEXT NOT NULL DEFAULT ''"},
+			{"session_kind", "session_kind TEXT NOT NULL DEFAULT ''"},
 			{"first_message", "first_message TEXT"},
 			{"display_name", "display_name TEXT"},
 			{"session_name", "session_name TEXT"},
@@ -280,6 +283,7 @@ var mirrorTables = []tableSpec{
 			claude_request_id TEXT NOT NULL DEFAULT '',
 			source_type TEXT NOT NULL DEFAULT '',
 			source_subtype TEXT NOT NULL DEFAULT '',
+			prompt_source TEXT NOT NULL DEFAULT '',
 			source_uuid TEXT NOT NULL DEFAULT '',
 			source_parent_uuid TEXT NOT NULL DEFAULT '',
 			is_sidechain BOOLEAN NOT NULL DEFAULT FALSE,
@@ -308,6 +312,7 @@ var mirrorTables = []tableSpec{
 			{"claude_request_id", "claude_request_id TEXT NOT NULL DEFAULT ''"},
 			{"source_type", "source_type TEXT NOT NULL DEFAULT ''"},
 			{"source_subtype", "source_subtype TEXT NOT NULL DEFAULT ''"},
+			{"prompt_source", "prompt_source TEXT NOT NULL DEFAULT ''"},
 			{"source_uuid", "source_uuid TEXT NOT NULL DEFAULT ''"},
 			{"source_parent_uuid", "source_parent_uuid TEXT NOT NULL DEFAULT ''"},
 			{"is_sidechain", "is_sidechain BOOLEAN NOT NULL DEFAULT FALSE"},

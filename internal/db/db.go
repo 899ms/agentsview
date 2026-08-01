@@ -361,7 +361,10 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // last_activity_at, the Devin fingerprint hashes only raw epoch integers and
 // zero-time metadata, so it is byte-identical before and after the fix and
 // incremental sync would skip the correction.)
-const dataVersion = 78
+// (79: Claude launch/prompt provenance. Re-parsing populates the new
+// sessions.session_kind and messages.prompt_source columns from top-level
+// sessionKind and promptSource fields on existing Claude rows.)
+const dataVersion = 79
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -1817,6 +1820,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE messages ADD COLUMN source_subtype TEXT NOT NULL DEFAULT ''",
 		},
 		{
+			"messages", "prompt_source",
+			"ALTER TABLE messages ADD COLUMN prompt_source TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"messages", "source_uuid",
 			"ALTER TABLE messages ADD COLUMN source_uuid TEXT NOT NULL DEFAULT ''",
 		},
@@ -1983,6 +1990,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"sessions", "entrypoint",
 			"ALTER TABLE sessions ADD COLUMN entrypoint TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "session_kind",
+			"ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT ''",
 		},
 		{
 			"sessions", "transcript_fidelity",
@@ -2300,6 +2311,7 @@ WHEN (
     OLD.agent IS NOT NEW.agent OR
     OLD.agent_label IS NOT NEW.agent_label OR
     OLD.entrypoint IS NOT NEW.entrypoint OR
+    OLD.session_kind IS NOT NEW.session_kind OR
     OLD.first_message IS NOT NEW.first_message OR
     OLD.display_name IS NOT NEW.display_name OR
     OLD.session_name IS NOT NEW.session_name OR

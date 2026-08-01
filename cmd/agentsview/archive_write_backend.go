@@ -179,7 +179,7 @@ func archivePushWatchWatcherOptions(
 
 func archivePushWatchBatchCallback(
 	appCfg config.Config,
-	engine *syncpkg.Engine,
+	engine watchSyncer,
 	loop *pushLoop,
 ) syncpkg.WatchCallback {
 	return func(callbackCtx context.Context, batch syncpkg.WatchBatch) error {
@@ -189,7 +189,9 @@ func archivePushWatchBatchCallback(
 		if err := syncWatchBatch(callbackCtx, engine, batch, scope); err != nil {
 			return err
 		}
-		return notifyPushForWatchBatch(callbackCtx, loop, batch)
+		return notifyPushForWatchBatchWithConfig(
+			callbackCtx, loop, appCfg, batch,
+		)
 	}
 }
 
@@ -249,6 +251,97 @@ func notifyPushForWatchBatch(
 	}
 }
 
+func notifyPushForWatchBatchWithConfig(
+	ctx context.Context,
+	loop *pushLoop,
+	cfg config.Config,
+	batch syncpkg.WatchBatch,
+) error {
+	if watchBatchIsAffirmativelyNonData(ctx, cfg, batch) {
+		return nil
+	}
+	return notifyPushForWatchBatch(ctx, loop, batch)
+}
+
+type watchPathRelevanceProvider struct {
+	provider           parser.Provider
+	root               string
+	relevanceSupported bool
+}
+
+func watchBatchIsAffirmativelyNonData(
+	ctx context.Context,
+	cfg config.Config,
+	batch syncpkg.WatchBatch,
+) bool {
+	if ctx.Err() != nil || len(batch.Paths) == 0 || batch.FullSync ||
+		batch.LostEvents || len(batch.ReconcileRoots) > 0 ||
+		len(batch.Renames) > 0 {
+		return false
+	}
+
+	providers := configuredWatchPathRelevanceProviders(cfg)
+	if len(providers) == 0 {
+		return false
+	}
+	for _, path := range batch.Paths {
+		if path == "" {
+			return false
+		}
+		path = absRootPath(path)
+		matched := false
+		for _, candidate := range providers {
+			if !pathWithinRoot(path, candidate.root) {
+				continue
+			}
+			matched = true
+			if !candidate.relevanceSupported {
+				return false
+			}
+			relevance, err := parser.ResolveChangedPathRelevance(
+				ctx, candidate.provider, parser.ChangedPathRequest{
+					Path: path, WatchRoot: candidate.root,
+				},
+			)
+			if err != nil || relevance != parser.ChangedPathNonData {
+				return false
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func configuredWatchPathRelevanceProviders(
+	cfg config.Config,
+) []watchPathRelevanceProvider {
+	var providers []watchPathRelevanceProvider
+	for _, factory := range parser.ProviderFactories() {
+		relevanceSupported := factory.Capabilities().Source.ChangedPathRelevance ==
+			parser.CapabilitySupported
+		roots := cfg.ResolveDirs(factory.Definition().Type)
+		for _, root := range roots {
+			if root == "" {
+				continue
+			}
+			root = absRootPath(root)
+			var provider parser.Provider
+			if relevanceSupported {
+				provider = factory.NewProvider(parser.ProviderConfig{
+					Roots: []string{root},
+				})
+			}
+			providers = append(providers, watchPathRelevanceProvider{
+				provider:           provider,
+				root:               root,
+				relevanceSupported: relevanceSupported,
+			})
+		}
+	}
+	return providers
+}
 func watchBatchNeedsPushAck(batch syncpkg.WatchBatch) bool {
 	if batch.FullSync || len(batch.ReconcileRoots) > 0 {
 		return true
@@ -471,7 +564,9 @@ func (b daemonArchiveWriteBackend) DuckDBPushWatch(
 	stopWatcher, openDispatch, unwatchedDirs := startArchivePushWatcher(
 		b.watchHooks, b.appCfg, nil,
 		func(callbackCtx context.Context, batch syncpkg.WatchBatch) error {
-			return notifyPushForWatchBatch(callbackCtx, loop, batch)
+			return notifyPushForWatchBatchWithConfig(
+				callbackCtx, loop, b.appCfg, batch,
+			)
 		},
 		syncpkg.WatcherOptions{OnCoverageDegraded: loop.NotifyCoverageDegraded},
 	)
@@ -601,7 +696,9 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 	stopWatcher, openDispatch, unwatchedDirs := startArchivePushWatcher(
 		b.watchHooks, b.appCfg, nil,
 		func(callbackCtx context.Context, batch syncpkg.WatchBatch) error {
-			return notifyPushForWatchBatch(callbackCtx, loop, batch)
+			return notifyPushForWatchBatchWithConfig(
+				callbackCtx, loop, b.appCfg, batch,
+			)
 		},
 		syncpkg.WatcherOptions{OnCoverageDegraded: loop.NotifyCoverageDegraded},
 	)

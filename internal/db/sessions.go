@@ -2966,6 +2966,100 @@ func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
 	return ids, nil
 }
 
+const sessionMachineBatchSize = 500
+
+// SessionWriteIdentity is the stored evidence used to decide whether a copied
+// source may reuse the session's machine for local project identity discovery.
+type SessionWriteIdentity struct {
+	Machine  string
+	Agent    string
+	FilePath string
+	FileHash string
+}
+
+// ListSessionWriteIdentitiesByID returns stored source evidence for each
+// requested session, including tombstoned rows that may be revived by a later
+// successful parse. Requests are chunked below SQLite's bind-variable limit.
+func (db *DB) ListSessionWriteIdentitiesByID(
+	ctx context.Context,
+	ids []string,
+) (map[string]SessionWriteIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	identities := make(map[string]SessionWriteIdentity, len(ids))
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	for start := 0; start < len(unique); start += sessionMachineBatchSize {
+		end := min(start+sessionMachineBatchSize, len(unique))
+		batch := unique[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		rows, err := db.getReader().QueryContext(ctx, `
+			SELECT id, machine, agent,
+			       COALESCE(file_path, ''), COALESCE(file_hash, '')
+			FROM sessions
+			WHERE id IN (`+placeholders+`)
+			ORDER BY id`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("listing session write identities by ID: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			var identity SessionWriteIdentity
+			if err := rows.Scan(
+				&id, &identity.Machine, &identity.Agent,
+				&identity.FilePath, &identity.FileHash,
+			); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"scanning session write identity by ID: %w", err,
+				)
+			}
+			identities[id] = identity
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterating session write identities by ID: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("closing session write identities by ID: %w", err)
+		}
+	}
+	return identities, nil
+}
+
+// ListSessionMachinesByID returns the stored machine attribution for each
+// requested session, including tombstoned rows that may be revived by a later
+// successful parse. Requests are chunked below SQLite's bind-variable limit.
+func (db *DB) ListSessionMachinesByID(
+	ctx context.Context,
+	ids []string,
+) (map[string]string, error) {
+	identities, err := db.ListSessionWriteIdentitiesByID(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	machines := make(map[string]string, len(ids))
+	for id, identity := range identities {
+		machines[id] = identity.Machine
+	}
+	return machines, nil
+}
+
 const descendantSessionRootBatchSize = 100
 
 // ListActiveDescendantSessionSourcePaths returns the source paths of active
@@ -3090,13 +3184,22 @@ type SessionSourcePath struct {
 	FilePath string
 }
 
+// SessionSourceAttribution is one distinct immutable machine label represented
+// by active sessions at an exact provider source.
+type SessionSourceAttribution struct {
+	Machine  string
+	Agent    string
+	FilePath string
+}
+
 func (o SessionSourceOwnership) Cursor() SessionSourceCursor {
 	return SessionSourceCursor{Agent: o.Agent, FilePath: o.FilePath, ID: o.ID}
 }
 
 // ListActiveSessionSourceOwnershipScopesPage returns one stable keyset page
-// across a provider's bounded physical scopes. Normalization deduplicates
-// repeated declarations before building the query.
+// across a provider's bounded physical scopes. Machine is an exact stored key,
+// including the empty key retained by legacy sessions. Normalization
+// deduplicates repeated declarations before building the query.
 func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 	ctx context.Context,
 	machine string,
@@ -3105,7 +3208,7 @@ func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 	after SessionSourceCursor,
 ) ([]SessionSourceOwnership, error) {
 	scopes = normalizeStoredSourcePathHintScopes(scopes)
-	if machine == "" || agent == "" || len(scopes) == 0 {
+	if agent == "" || len(scopes) == 0 {
 		return nil, nil
 	}
 	if after.Agent != "" && after.Agent != agent {
@@ -3236,8 +3339,9 @@ func mergeSessionSourceOwnershipPages(
 }
 
 // BaselineActiveSessionSourcePaths marks exact active local ownerships as
-// observed. Callers pass one bounded discovery page or changed-path batch at a
-// time so this update never scales its live memory with the archive.
+// observed. Machine is an exact stored key, including the empty key retained by
+// legacy sessions. Callers pass one bounded discovery page or changed-path
+// batch at a time so this update never scales its live memory with the archive.
 func (db *DB) BaselineActiveSessionSourcePaths(
 	ctx context.Context,
 	machine string,
@@ -3246,7 +3350,7 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if machine == "" || len(sources) == 0 {
+	if len(sources) == 0 {
 		return nil
 	}
 	db.mu.Lock()
@@ -3268,9 +3372,10 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 }
 
 // ReplaceActiveSessionSourceBaselines makes admitted the exact subset of a
-// bounded candidate page that carries deletion proof. Existing proof for
-// rejected candidates is removed in the same transaction that admits the
-// successful candidates.
+// bounded candidate page that carries deletion proof. Machine is an exact
+// stored key, including the empty key retained by legacy sessions. Existing
+// proof for rejected candidates is removed in the same transaction that admits
+// the successful candidates.
 //
 // The replacement is a diff, not a rewrite: warm no-op syncs replay every
 // unchanged archived source as an admitted candidate each pass, so unchanged
@@ -3286,7 +3391,7 @@ func (db *DB) ReplaceActiveSessionSourceBaselines(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if machine == "" || len(candidates) == 0 {
+	if len(candidates) == 0 {
 		return nil
 	}
 	rejected := rejectedSourceCandidates(candidates, admitted)
@@ -3407,6 +3512,75 @@ func buildSourcePairFilter(sources []SessionSourcePath) (string, []any, bool) {
 	}
 	sb.WriteString(")")
 	return sb.String(), args, true
+}
+
+// ListActiveSessionSourceAttributions returns every distinct machine label
+// represented by active rows at the requested exact sources. A shared provider
+// database may contain sessions admitted under multiple immutable labels, so
+// the result is intentionally not collapsed to one machine per path.
+func (db *DB) ListActiveSessionSourceAttributions(
+	ctx context.Context,
+	sources []SessionSourcePath,
+) ([]SessionSourceAttribution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	seen := make(map[SessionSourceAttribution]struct{})
+	for start := 0; start < len(sources); start += baselinePairChunk {
+		end := min(start+baselinePairChunk, len(sources))
+		filter, args, ok := buildSourcePairFilter(sources[start:end])
+		if !ok {
+			continue
+		}
+		rows, err := db.getReader().QueryContext(ctx, `
+			SELECT DISTINCT machine, agent, file_path
+			FROM sessions
+			WHERE `+filter+`
+			  AND file_path IS NOT NULL
+			  AND deleted_at IS NULL`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("listing active session source attributions: %w", err)
+		}
+		for rows.Next() {
+			var attribution SessionSourceAttribution
+			if err := rows.Scan(
+				&attribution.Machine,
+				&attribution.Agent,
+				&attribution.FilePath,
+			); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"scanning active session source attribution: %w", err,
+				)
+			}
+			seen[attribution] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf(
+				"iterating active session source attributions: %w", err,
+			)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf(
+				"closing active session source attributions: %w", err,
+			)
+		}
+	}
+	attributions := make([]SessionSourceAttribution, 0, len(seen))
+	for attribution := range seen {
+		attributions = append(attributions, attribution)
+	}
+	sort.Slice(attributions, func(i, j int) bool {
+		if attributions[i].Machine != attributions[j].Machine {
+			return attributions[i].Machine < attributions[j].Machine
+		}
+		if attributions[i].Agent != attributions[j].Agent {
+			return attributions[i].Agent < attributions[j].Agent
+		}
+		return attributions[i].FilePath < attributions[j].FilePath
+	})
+	return attributions, nil
 }
 
 func baselineActiveSessionSourcePathsTx(

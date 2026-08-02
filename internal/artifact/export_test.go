@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +44,38 @@ func testExportDB(t *testing.T) *db.DB {
 	database := testDB(t)
 	require.NoError(t, database.SetSyncState(originStateKey, contractOrigin))
 	return database
+}
+
+// seedBareExportSessions inserts the minimal rows these export cardinality
+// tests need in one transaction. The real sessions-table export triggers still
+// enqueue every local row; parser validation and message replacement are not
+// part of the behavior under test here.
+func seedBareExportSessions(
+	t *testing.T,
+	database *db.DB,
+	count int,
+	idFormat string,
+	machine string,
+) {
+	t.Helper()
+	ctx := t.Context()
+	require.NoError(t, database.Update(func(tx *sql.Tx) error {
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO sessions
+			(id, project, machine, agent, created_at)
+			VALUES (?, 'project', ?, 'claude', '2026-06-14T01:02:03Z')`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+		for i := range count {
+			if _, err := stmt.ExecContext(
+				ctx, fmt.Sprintf(idFormat, i), machine,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}), "seed bare export sessions")
 }
 
 // latestStoreCheckpointForTest locates the highest-sequence checkpoint for
@@ -1421,12 +1454,9 @@ func TestArtifactExportCardinalityLoadsOnlyDirtyBatch(t *testing.T) {
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
 			database := testExportDB(t)
-			for i := range archiveSize {
-				require.NoError(t, database.UpsertSession(db.Session{
-					ID: fmt.Sprintf("peer-%04d", i), Project: "project",
-					Machine: "peer-a1b2c3", Agent: "claude",
-				}))
-			}
+			seedBareExportSessions(
+				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
+			)
 			require.NoError(t, database.UpsertSession(db.Session{
 				ID: "dirty", Project: "project", Machine: "local", Agent: "claude",
 			}))
@@ -1463,12 +1493,9 @@ func TestExportToStoreCardinalityIgnoresUnrelatedArchiveBodies(t *testing.T) {
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
 			database := testExportDB(t)
-			for i := range archiveSize {
-				require.NoError(t, database.UpsertSession(db.Session{
-					ID: fmt.Sprintf("peer-%04d", i), Project: "project",
-					Machine: "peer-a1b2c3", Agent: "claude",
-				}))
-			}
+			seedBareExportSessions(
+				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
+			)
 			seedSession(t, database, "dirty", "project")
 			counted := &countingCanonicalExportDB{DB: database}
 			filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1536,12 +1563,9 @@ func TestExportToStoreFullDrainsMoreThanOneClaimPage(t *testing.T) {
 
 	database := testExportDB(t)
 	const total = 1025
-	for i := range total {
-		require.NoError(t, database.UpsertSession(db.Session{
-			ID: fmt.Sprintf("session-%04d", i), Project: "project",
-			Machine: "local", Agent: "claude", CreatedAt: "2026-06-14T01:02:03Z",
-		}))
-	}
+	seedBareExportSessions(
+		t, database, total, "session-%04d", "local",
+	)
 	counted := &countingCanonicalExportDB{DB: database}
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
@@ -1577,12 +1601,7 @@ func TestExportToStoreExplicitSessionIDsClaimBeyondOldestQueuePage(t *testing.T)
 
 	database := testExportDB(t)
 	const total = 1025
-	for i := range total {
-		require.NoError(t, database.UpsertSession(db.Session{
-			ID: fmt.Sprintf("session-%04d", i), Project: "project",
-			Machine: "local", Agent: "claude",
-		}))
-	}
+	seedBareExportSessions(t, database, total, "session-%04d", "local")
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })

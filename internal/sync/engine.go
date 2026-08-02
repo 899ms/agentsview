@@ -2379,6 +2379,26 @@ func (e *Engine) resyncBuildLocked(
 		}
 	}
 
+	// CopySyncStateFrom runs after the fresh archive's normal linking pass so
+	// pending hierarchy work from the original must be consumed explicitly.
+	// Wait until orphan restoration is complete so every queued session and
+	// copied spawn edge is present. A failed repair leaves hierarchy state
+	// uncertain and must abort before the replacement can be installed.
+	if err := newDB.RepairQueuedSubagentParents(); err != nil {
+		log.Printf("resync: repair copied subagent parents: %v", err)
+		stats.Aborted = true
+		stats.Warnings = append(stats.Warnings,
+			"hierarchy repair failed, aborting swap: "+err.Error(),
+		)
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, err
+	}
+
 	// Copy recall entries and their evidence from the quiesced old DB.
 	// The fresh DB is built from source files, which never contain
 	// recall entries, so without this every accepted entry is lost on
@@ -7032,6 +7052,39 @@ func (e *Engine) collectAndBatch(
 		sourceAllowsParserExclusions := e.sourceAllowsParserExclusions(
 			r.processResult,
 		)
+		// Capture children before exclusions or full replacements cascade the
+		// current spawn edges away. The global linker below can resolve only
+		// children still named by an edge, so carry former children into its
+		// scoped dangling-parent cleanup explicitly.
+		excluded := e.applyIDPrefixToSessionIDs(r.excludedSessionIDs)
+		if !sourceAllowsParserExclusions {
+			excluded = nil
+		}
+		resultIDs := make([]string, 0, len(r.results))
+		for _, result := range r.results {
+			resultIDs = append(resultIDs, result.Session.ID)
+		}
+		resultIDs = e.applyIDPrefixToSessionIDs(resultIDs)
+		children, err := e.db.SubagentChildSessionIDs(append(
+			append([]string{}, excluded...), resultIDs...,
+		))
+		if err != nil {
+			log.Printf("list pre-write subagent children: %v", err)
+			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.path, false)
+			r.releaseRetention()
+			continue
+		}
+		// Persist affected IDs before any exclusion or replacement can
+		// cascade their only spawn edge away. The queue is cleared only in
+		// the same transaction that successfully repairs the hierarchy.
+		if err := e.db.QueueSubagentParentCleanupRepairs(children); err != nil {
+			log.Printf("queue subagent parent repairs: %v", err)
+			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.path, false)
+			r.releaseRetention()
+			continue
+		}
 		excludedSessionIDs, err := e.deleteParserExcludedSessions(
 			r.processResult, sourceAllowsParserExclusions,
 		)
@@ -7242,6 +7295,10 @@ flush:
 			log.Printf("link subagent sessions: %v", err)
 			stats.RecordFailed()
 		}
+	}
+	if err := e.db.RepairQueuedSubagentParents(); err != nil {
+		log.Printf("repair queued subagent parents: %v", err)
+		stats.RecordFailed()
 	}
 
 	// PhaseDone is emitted by syncAllLocked after DB-backed
@@ -13655,6 +13712,16 @@ func (e *Engine) SyncSingleSessionContext(
 		return res.err
 	}
 	if res.skip {
+		if err := e.db.RepairQueuedSubagentParents(); err != nil {
+			return fmt.Errorf("repair queued subagent parents: %w", err)
+		}
+		// A previous write may have stored a new spawn edge but failed
+		// before its child could be durably queued. The requested session is
+		// still a bounded repair seed on the freshness path because its
+		// surviving edges identify those children directly.
+		if err := e.db.LinkSubagentSessionsForSessions([]string{sessionID}); err != nil {
+			return fmt.Errorf("link fresh subagent sessions: %w", err)
+		}
 		return nil
 	}
 	if res.cacheSkip {
@@ -13662,6 +13729,62 @@ func (e *Engine) SyncSingleSessionContext(
 	}
 
 	sourceAllowsParserExclusions := e.sourceAllowsParserExclusions(res)
+
+	// Capture the children this batch's PRE-write spawn edges reference.
+	// The parser-exclusion delete below and the full message replacement
+	// in the write loop both cascade tool_calls away, and the scoped
+	// linker discovers children only through post-write edges — so a
+	// child whose edge is about to be removed must be carried into the
+	// linking batch explicitly, or it could never re-resolve to a
+	// remaining spawner until the next bulk sync.
+	excluded := e.applyIDPrefixToSessionIDs(res.excludedSessionIDs)
+	resultIDs := make([]string, 0, len(res.results))
+	for _, pr := range res.results {
+		resultIDs = append(resultIDs, pr.Session.ID)
+	}
+	resultIDs = e.applyIDPrefixToSessionIDs(resultIDs)
+	priorChildren, childErr := e.db.SubagentChildSessionIDs(
+		append(append([]string{}, excluded...), resultIDs...),
+	)
+	if childErr != nil {
+		return fmt.Errorf("list pre-write subagent children: %w", childErr)
+	}
+	// A prior sync may have removed an edge and then failed before repairing
+	// its child. Retry that durable work after this sync's read-only capture
+	// but before making any new mutations.
+	if err := e.db.RepairQueuedSubagentParents(); err != nil {
+		return fmt.Errorf("repair queued subagent parents: %w", err)
+	}
+	if err := e.db.QueueSubagentParentCleanupRepairs(priorChildren); err != nil {
+		return fmt.Errorf("queue subagent parent repairs: %w", err)
+	}
+	// Always attempt queued work after mutations begin, including when a later
+	// write or scoped link fails. Post-write capture below expands this flag
+	// when the write introduces children that did not exist before it.
+	repairQueued := len(priorChildren) > 0
+	defer func() {
+		if !repairQueued {
+			return
+		}
+		if repairErr := e.db.RepairQueuedSubagentParents(); repairErr != nil {
+			err = errors.Join(err, fmt.Errorf(
+				"repair queued subagent parents: %w", repairErr,
+			))
+		}
+	}()
+	queueWrittenChildren := func(spawnerIDs []string) error {
+		children, childErr := e.db.SubagentChildSessionIDs(spawnerIDs)
+		if childErr != nil {
+			return fmt.Errorf("list post-write subagent children: %w", childErr)
+		}
+		if err := e.db.QueueSubagentParentRepairs(children); err != nil {
+			return fmt.Errorf("queue post-write subagent parent repairs: %w", err)
+		}
+		if len(children) > 0 {
+			repairQueued = true
+		}
+		return nil
+	}
 
 	// Delete parser-excluded sessions before writing the parsed
 	// results, mirroring collectAndBatch. Vibe promotes a session
@@ -13713,6 +13836,16 @@ func (e *Engine) SyncSingleSessionContext(
 		if err := e.writeIncremental(res.incremental); err != nil {
 			return err
 		}
+		if err := queueWrittenChildren(
+			[]string{res.incremental.sessionID},
+		); err != nil {
+			return err
+		}
+		if err := e.db.LinkSubagentSessionsForSessions(
+			[]string{res.incremental.sessionID},
+		); err != nil {
+			return fmt.Errorf("link incremental subagent sessions: %w", err)
+		}
 		return nil
 	}
 
@@ -13720,7 +13853,7 @@ func (e *Engine) SyncSingleSessionContext(
 		return nil
 	}
 
-	for _, pr := range res.results {
+	for i, pr := range res.results {
 		write := pendingWrite{
 			sess:         pr.Session,
 			msgs:         pr.Messages,
@@ -13728,26 +13861,47 @@ func (e *Engine) SyncSingleSessionContext(
 			needsRetry:   res.needsRetryForSession(pr.Session.ID),
 			forceReplace: res.forceReplace,
 		}
-		if err := e.writeSessionFull(write); err != nil &&
-			!isIntentionalSessionSkip(err) &&
-			!errors.Is(err, errSessionPreserved) {
+		// The session upsert commits parser-derived parent provenance before
+		// the later content, usage, and completion stages. Queue the attempted
+		// session itself first so a failure after that upsert still re-resolves
+		// its incoming spawn edges in the deferred repair pass.
+		if err := e.db.QueueSubagentParentRepairs(
+			[]string{resultIDs[i]},
+		); err != nil {
+			return fmt.Errorf(
+				"queue attempted session parent repair: %w", err,
+			)
+		}
+		repairQueued = true
+		writeErr := e.writeSessionFull(write)
+		// Full-write stages commit independently. Message content (and a new
+		// spawn edge) can persist even when a later usage, data-version, or
+		// sibling write fails, so discover and queue children after every
+		// attempt rather than waiting for the entire result set to finish.
+		queueErr := queueWrittenChildren([]string{resultIDs[i]})
+		if writeErr != nil &&
+			!isIntentionalSessionSkip(writeErr) &&
+			!errors.Is(writeErr, errSessionPreserved) {
 			// Mirror the batch write paths: a partial write (session
 			// row updated, messages or usage not) must demote the
 			// stored data version, or the next container parse would
 			// compare the member as unchanged and never repair it.
 			e.markStaleFailedMemberWrite(write)
+			if queueErr != nil {
+				writeErr = errors.Join(writeErr, queueErr)
+			}
 			return fmt.Errorf("write session %s: %w",
-				pr.Session.ID, err)
-		} else if errors.Is(err, errSessionPreserved) {
+				pr.Session.ID, writeErr)
+		}
+		if queueErr != nil {
+			return queueErr
+		}
+		if errors.Is(writeErr, errSessionPreserved) {
 			preserved = true
 		}
 	}
-
-	// Link subagent child sessions to their parents.
-	// Required for Zencoder sessions that reference subagent
-	// session IDs in tool_calls.subagent_session_id.
-	if err := e.db.LinkSubagentSessions(); err != nil {
-		log.Printf("link subagent sessions: %v", err)
+	if err := e.db.LinkSubagentSessionsForSessions(resultIDs); err != nil {
+		return fmt.Errorf("link changed subagent sessions: %w", err)
 	}
 
 	return nil

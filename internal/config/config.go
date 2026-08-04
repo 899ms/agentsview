@@ -1474,6 +1474,14 @@ func dataDirFromEnv() string {
 func (c *Config) loadEnv() {
 	for _, def := range parser.Registry {
 		if v := os.Getenv(def.EnvVar); v != "" {
+			if def.Type == parser.AgentGoose {
+				v = parser.ResolveGoosePathRoot(v)
+				if v == "" {
+					// A whitespace-only override must not replace the
+					// defaults or a configured goose_dirs entry.
+					continue
+				}
+			}
 			c.AgentDirs[def.Type] = []string{v}
 			c.agentDirSource[def.Type] = dirEnv
 		}

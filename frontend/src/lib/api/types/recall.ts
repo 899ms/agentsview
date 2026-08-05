@@ -67,11 +67,48 @@ export interface RecallExtractProgressStats {
 
 export interface RecallExtractionStatus {
   configured: boolean;
+  progress_available: boolean;
   fingerprint?: string;
   generations?: RecallExtractGeneration[];
   source_runs?: string[];
   stats?: RecallExtractProgressStats;
   eligible_backlog?: number;
+}
+
+export type RecallExtractProgressState = "pending" | "partial" | "failed";
+
+export interface RecallExtractProgress {
+  session_id: string;
+  generation_fingerprint: string;
+  state: RecallExtractProgressState;
+  unit_cursor: number;
+  units_total: number;
+  last_error?: string;
+  updated_at: string;
+  session_title: string;
+  project: string;
+  agent: string;
+  retry_at?: string;
+  retry_eligible?: boolean;
+}
+
+export interface RecallExtractProgressResponse {
+  generation_fingerprint?: string;
+  progress?: RecallExtractProgress[];
+  next_cursor?: string;
+}
+
+export interface RecallExtractProgressPage {
+  generationFingerprint?: string;
+  progress: RecallExtractProgress[];
+  nextCursor?: string;
+}
+
+export interface RecallExtractProgressFilters {
+  generation?: string;
+  state?: RecallExtractProgressState;
+  limit?: number;
+  cursor?: string;
 }
 
 export interface RecallEntryFilters {

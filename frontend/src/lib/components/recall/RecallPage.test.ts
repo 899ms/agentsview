@@ -9,6 +9,7 @@ import {
 } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { setLocale } from "../../i18n/index.js";
+import { router } from "../../stores/router.svelte.js";
 
 // @ts-ignore
 import RecallPage from "./RecallPage.svelte";
@@ -24,6 +25,7 @@ describe("RecallPage", () => {
       if (url.includes("/recall/extraction/status")) {
         return new Response(JSON.stringify({
           configured: true,
+          progress_available: true,
           fingerprint: "generation-active",
           source_runs: [
             "generation-active",
@@ -62,6 +64,42 @@ describe("RecallPage", () => {
             entries: 12,
           },
           eligible_backlog: 3,
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/recall/extraction/progress")) {
+        const failedOnly = url.includes("state=failed");
+        return new Response(JSON.stringify({
+          generation_fingerprint: "generation-active",
+          progress: [
+            ...(failedOnly ? [] : [{
+              session_id: "session-pending",
+              generation_fingerprint: "generation-active",
+              state: "pending",
+              unit_cursor: 0,
+              units_total: 3,
+              updated_at: "2026-07-23T11:45:00Z",
+              session_title: "Trace the pending extraction",
+              project: "agentsview",
+              agent: "codex",
+            }]),
+            {
+              session_id: "session-failed",
+              generation_fingerprint: "generation-active",
+              state: "failed",
+              unit_cursor: 1,
+              units_total: 4,
+              last_error: "Model response was empty",
+              updated_at: "2026-07-23T11:30:00Z",
+              session_title: "Diagnose the failed extraction",
+              project: "agentsview",
+              agent: "codex",
+              retry_at: "2026-07-23T12:30:00Z",
+              retry_eligible: true,
+            },
+          ],
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -140,6 +178,7 @@ describe("RecallPage", () => {
       component = undefined;
     }
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     document.body.innerHTML = "";
   });
 
@@ -281,6 +320,157 @@ describe("RecallPage", () => {
     });
     expect(entryRequests).toBe(2);
     expect(statusRequests).toBe(2);
+  });
+
+  it("drills into actionable extraction progress and source sessions", async () => {
+    const navigate = vi
+      .spyOn(router, "navigateToSession")
+      .mockImplementation(() => {});
+    component = mount(RecallPage, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("8 done");
+    });
+
+    const showProgress = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.trim() === "Show progress");
+    expect(showProgress).toBeDefined();
+    showProgress!.click();
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(
+        'table[aria-label="Extraction sessions"]',
+      )).not.toBeNull();
+      expect(document.body.textContent).toContain(
+        "Trace the pending extraction",
+      );
+      expect(document.body.textContent).toContain(
+        "Model response was empty",
+      );
+      expect(Array.from(document.querySelectorAll(".progress-units"))
+        .map((cell) => cell.textContent?.replace(/\s+/g, " ").trim()))
+        .toContain("1 / 4");
+      expect(document.body.textContent).toContain("Retry ready");
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/recall/extraction/progress?limit=50&generation=generation-active",
+      ),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+
+    const sessionLink = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("a"),
+    ).find((link) => link.textContent?.trim() ===
+      "Diagnose the failed extraction");
+    expect(sessionLink).toBeDefined();
+    sessionLink!.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+    }));
+    expect(navigate).toHaveBeenCalledWith("session-failed");
+
+    const failedFilter = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('button[role="radio"]'),
+    ).find((button) => button.textContent?.trim() === "Failed");
+    expect(failedFilter).toBeDefined();
+    failedFilter!.click();
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("state=failed"),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(document.body.textContent).not.toContain(
+        "Trace the pending extraction",
+      );
+    });
+  });
+
+  it("returns refresh to idle when pending progress is hidden", async () => {
+    const defaultFetch = fetchMock as unknown as (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => Promise<Response>;
+    fetchMock = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (String(input).includes("/recall/extraction/progress")) {
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        });
+      }
+      return defaultFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    component = mount(RecallPage, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("8 done");
+    });
+
+    const refresh = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh"]',
+    );
+    const showProgress = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.trim() === "Show progress");
+    expect(refresh).not.toBeNull();
+    expect(showProgress).toBeDefined();
+
+    showProgress!.click();
+    await vi.waitFor(() => {
+      expect(refresh!.disabled).toBe(true);
+    });
+
+    const hideProgress = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.trim() === "Hide progress");
+    expect(hideProgress).toBeDefined();
+    hideProgress!.click();
+    await tick();
+
+    expect(refresh!.disabled).toBe(false);
+  });
+
+  it("hides extraction progress when the backend does not support it", async () => {
+    const defaultFetch = fetchMock as unknown as (
+      input: RequestInfo | URL,
+    ) => Promise<Response>;
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/recall/extraction/status")) {
+        return new Response(JSON.stringify({
+          configured: false,
+          progress_available: false,
+          source_runs: [],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return defaultFetch(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    component = mount(RecallPage, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "Keep extraction passes bounded",
+      );
+    });
+
+    expect(Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.trim() === "Show progress"))
+      .toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/recall/extraction/progress"),
+      expect.anything(),
+    );
   });
 
   it("loads the next cursor page and removes the truncation action", async () => {

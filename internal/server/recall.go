@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
@@ -51,6 +52,12 @@ type recallQueryRevisionProvider interface {
 
 type servedRecallSourceRunLister interface {
 	ListServedRecallSourceRuns(context.Context) ([]string, error)
+}
+
+type recallExtractProgressLister interface {
+	ListExtractProgress(
+		context.Context, db.ExtractProgressListQuery,
+	) (db.ExtractProgressList, error)
 }
 
 func (s *Server) handleListRecallEntries(
@@ -332,6 +339,7 @@ func decodeRecallListCursor(raw string) (recallListCursor, error) {
 func (s *Server) handleRecallExtractionStatus(
 	w http.ResponseWriter, r *http.Request,
 ) {
+	_, progressAvailable := s.db.(recallExtractProgressLister)
 	var sourceRuns []string
 	if lister, ok := s.db.(servedRecallSourceRunLister); ok {
 		var err error
@@ -346,8 +354,9 @@ func (s *Server) handleRecallExtractionStatus(
 	}
 	if s.recallExtractionStatus == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"configured":  false,
-			"source_runs": sourceRuns,
+			"configured":         false,
+			"progress_available": progressAvailable,
+			"source_runs":        sourceRuns,
 		})
 		return
 	}
@@ -373,12 +382,13 @@ func (s *Server) handleRecallExtractionStatus(
 		})
 	}
 	writeJSON(w, http.StatusOK, recallExtractionStatusResponse{
-		Configured:      true,
-		Fingerprint:     status.Fingerprint,
-		Generations:     generations,
-		SourceRuns:      sourceRuns,
-		Stats:           status.Stats,
-		EligibleBacklog: status.EligibleBacklog,
+		Configured:        true,
+		ProgressAvailable: progressAvailable,
+		Fingerprint:       status.Fingerprint,
+		Generations:       generations,
+		SourceRuns:        sourceRuns,
+		Stats:             status.Stats,
+		EligibleBacklog:   status.EligibleBacklog,
 	})
 }
 
@@ -392,12 +402,194 @@ type recallExtractGenerationStatus struct {
 }
 
 type recallExtractionStatusResponse struct {
-	Configured      bool                            `json:"configured"`
-	Fingerprint     string                          `json:"fingerprint,omitempty"`
-	Generations     []recallExtractGenerationStatus `json:"generations,omitempty"`
-	SourceRuns      []string                        `json:"source_runs,omitempty"`
-	Stats           db.ExtractProgressStats         `json:"stats"`
-	EligibleBacklog int                             `json:"eligible_backlog"`
+	Configured        bool                            `json:"configured"`
+	ProgressAvailable bool                            `json:"progress_available"`
+	Fingerprint       string                          `json:"fingerprint,omitempty"`
+	Generations       []recallExtractGenerationStatus `json:"generations,omitempty"`
+	SourceRuns        []string                        `json:"source_runs,omitempty"`
+	Stats             db.ExtractProgressStats         `json:"stats"`
+	EligibleBacklog   int                             `json:"eligible_backlog"`
+}
+
+const (
+	defaultRecallExtractProgressLimit = 50
+	maxRecallExtractProgressLimit     = 200
+)
+
+type recallExtractProgressCursor struct {
+	GenerationFingerprint string `json:"generation_fingerprint"`
+	State                 string `json:"state,omitempty"`
+	UpdatedAt             string `json:"updated_at"`
+	SessionID             string `json:"session_id"`
+}
+
+type recallExtractProgressItem struct {
+	SessionID             string `json:"session_id"`
+	GenerationFingerprint string `json:"generation_fingerprint"`
+	State                 string `json:"state"`
+	UnitCursor            int    `json:"unit_cursor"`
+	UnitsTotal            int    `json:"units_total"`
+	LastError             string `json:"last_error,omitempty"`
+	UpdatedAt             string `json:"updated_at"`
+	SessionTitle          string `json:"session_title"`
+	Project               string `json:"project"`
+	Agent                 string `json:"agent"`
+	RetryAt               string `json:"retry_at,omitempty"`
+	RetryEligible         bool   `json:"retry_eligible,omitempty"`
+}
+
+type recallExtractProgressResponse struct {
+	GenerationFingerprint string                      `json:"generation_fingerprint,omitempty"`
+	Progress              []recallExtractProgressItem `json:"progress"`
+	NextCursor            string                      `json:"next_cursor,omitempty"`
+}
+
+func (s *Server) handleRecallExtractionProgress(
+	w http.ResponseWriter, r *http.Request,
+) {
+	lister, ok := s.db.(recallExtractProgressLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented,
+			"recall extraction progress is not available in remote mode")
+		return
+	}
+	query := r.URL.Query()
+	limit, ok := parseIntParam(w, r, "limit")
+	if !ok {
+		return
+	}
+	if limit == 0 {
+		limit = defaultRecallExtractProgressLimit
+	}
+	if limit < 1 || limit > maxRecallExtractProgressLimit {
+		writeError(w, http.StatusBadRequest,
+			"recall extraction progress limit must be between 1 and 200")
+		return
+	}
+	state := strings.TrimSpace(query.Get("state"))
+	switch state {
+	case "", db.ExtractProgressPending, db.ExtractProgressPartial,
+		db.ExtractProgressFailed:
+	default:
+		writeError(w, http.StatusBadRequest,
+			"recall extraction progress state must be pending, partial, or failed")
+		return
+	}
+	fingerprint := strings.TrimSpace(query.Get("generation"))
+	var cursor recallExtractProgressCursor
+	if rawCursor := query.Get("cursor"); rawCursor != "" {
+		var err error
+		cursor, err = decodeRecallExtractProgressCursor(rawCursor)
+		if err != nil || (fingerprint != "" &&
+			fingerprint != cursor.GenerationFingerprint) ||
+			(state != "" && state != cursor.State) {
+			writeError(w, http.StatusBadRequest,
+				"invalid recall extraction progress cursor")
+			return
+		}
+		fingerprint = cursor.GenerationFingerprint
+		state = cursor.State
+	}
+
+	page, err := lister.ListExtractProgress(
+		r.Context(), db.ExtractProgressListQuery{
+			GenerationFingerprint: fingerprint,
+			State:                 state,
+			CursorUpdatedAt:       cursor.UpdatedAt,
+			CursorSessionID:       cursor.SessionID,
+			Limit:                 limit + 1,
+		},
+	)
+	if err != nil {
+		if handleContextError(w, err) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hasMore := len(page.Progress) > limit
+	if hasMore {
+		page.Progress = page.Progress[:limit]
+	}
+	response := recallExtractProgressResponse{
+		GenerationFingerprint: page.GenerationFingerprint,
+		Progress: make(
+			[]recallExtractProgressItem, 0, len(page.Progress),
+		),
+	}
+	backoff, _ := time.ParseDuration(s.cfg.Recall.Extract.FailureBackoff)
+	now := time.Now()
+	for _, progress := range page.Progress {
+		item := recallExtractProgressItem{
+			SessionID:             progress.SessionID,
+			GenerationFingerprint: progress.GenerationFingerprint,
+			State:                 progress.State,
+			UnitCursor:            progress.UnitCursor,
+			UnitsTotal:            progress.UnitsTotal,
+			LastError:             progress.LastError,
+			UpdatedAt:             progress.UpdatedAt,
+			SessionTitle:          progress.SessionTitle,
+			Project:               progress.Project,
+			Agent:                 progress.Agent,
+		}
+		if progress.State == db.ExtractProgressFailed && backoff > 0 {
+			if updatedAt, err := time.Parse(
+				time.RFC3339Nano, progress.UpdatedAt,
+			); err == nil {
+				retryAt := updatedAt.Add(backoff)
+				item.RetryAt = retryAt.UTC().Format(time.RFC3339Nano)
+				item.RetryEligible = !now.Before(retryAt)
+			}
+		}
+		response.Progress = append(response.Progress, item)
+	}
+	if hasMore {
+		last := page.Progress[len(page.Progress)-1]
+		response.NextCursor = encodeRecallExtractProgressCursor(
+			recallExtractProgressCursor{
+				GenerationFingerprint: page.GenerationFingerprint,
+				State:                 state,
+				UpdatedAt:             last.UpdatedAt,
+				SessionID:             last.SessionID,
+			},
+		)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func encodeRecallExtractProgressCursor(
+	cursor recallExtractProgressCursor,
+) string {
+	data, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeRecallExtractProgressCursor(
+	raw string,
+) (recallExtractProgressCursor, error) {
+	var cursor recallExtractProgressCursor
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return cursor, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil {
+		return recallExtractProgressCursor{}, err
+	}
+	if cursor.GenerationFingerprint == "" || cursor.UpdatedAt == "" ||
+		cursor.SessionID == "" {
+		return recallExtractProgressCursor{}, errors.New(
+			"incomplete recall extraction progress cursor")
+	}
+	switch cursor.State {
+	case "", db.ExtractProgressPending, db.ExtractProgressPartial,
+		db.ExtractProgressFailed:
+		return cursor, nil
+	default:
+		return recallExtractProgressCursor{}, errors.New(
+			"invalid recall extraction progress cursor state")
+	}
 }
 
 func (s *Server) handleGetRecallEntry(

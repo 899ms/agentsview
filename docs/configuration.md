@@ -270,6 +270,7 @@ can still be parsed.
 | OpenHands CLI         | `~/.openhands/conversations/`                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                            |
 | Omnigent              | `~/.omnigent/`                                                                   | SQLite `chat.db`, one session per conversation                                                                                  |
 | Pi                    | `~/.pi/agent/sessions/`                                                          | JSONL per session                                                                                                               |
+| Prime Agent           | `~/.prime/agent/sessions/`                                                       | Flat Pi-family JSONL sessions                                                                                                   |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) | NDJSON trajectory files                                                                                                         |
 | Piebald               | `~/.local/share/piebald/`                                                        | SQLite database (`app.db`)                                                                                                      |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                   |
@@ -290,6 +291,11 @@ can still be parsed.
 | ZCode                 | `~/.zcode/cli/db/` or `~/.zcode/cli/`                                            | SQLite database (`db.sqlite`) with usage rows                                                                                   |
 | Zed                   | (platform-specific, see below)                                                   | SQLite database (`threads/threads.db`)                                                                                          |
 | Zencoder              | `~/.zencoder/sessions/`                                                          | JSONL per session                                                                                                               |
+
+Prime Agent support targets the current flat session layout in v0.7.0. That
+release migrates the older per-project layout when Prime Agent opens its
+session store, so open the current Prime Agent once before syncing a legacy
+archive with AgentsView.
 
 Grok sessions are read from `summary.json` (title, timestamps, project),
 optional `signals.json` (token counters), and `chat_history.jsonl` when
@@ -659,7 +665,7 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `gptme_dirs`, `grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
 `kilo_legacy_dirs`, `kimi_dirs`, `kimi_work_dirs`, `kiro_dirs`, `kiro_ide_dirs`,
 `mimocode_dirs`, `vibe_session_dirs`, `omp_dirs`, `openclaw_dirs`,
-`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `piebald_dirs`,
+`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `prime_agent_dirs`, `piebald_dirs`,
 `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`, `qoder_project_dirs`,
 `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
 `shelley_dirs`, `visualstudio_copilot_dirs`, `vscode_copilot_dirs`,

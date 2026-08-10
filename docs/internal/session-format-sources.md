@@ -180,6 +180,30 @@ Grok section and remove the explicit registry exception in the coverage test.
   `promptSource` (per user turn, e.g. `"typed"`, `"queued"`, `"system"`,
   `"sdk"`). Neither key is documented upstream or covered by the codeburn
   notes; the evidence remains local observation under `no-public-source`.
+  Reverified 2026-08-09 against controlled `--resume <session> --fork-session`
+  reproductions and inspection of the Claude Code 2.1.226 bundle
+  ([#1370](https://github.com/kenn-io/agentsview/issues/1370)): the background
+  handoff (left-arrow picker, Ctrl+B, `/background`) spawns
+  `claude --resume <transcript> --fork-session` with
+  `CLAUDE_CODE_SESSION_KIND=bg`. The forked process re-persists the entire
+  prior message chain into a new transcript in the same project directory;
+  replayed chain entries are byte-identical to the originals (same `uuid`,
+  `parentUuid`, `timestamp`, `requestId`, `message.id`, and usage) except for
+  a rewritten `sessionId` and, when spawned by the background launcher, an
+  injected `sessionKind:"bg"` on every chain entry. The new transcript carries
+  no pointer back to the original session (no Codex-style `forked_from_id`),
+  so `internal/parser/claude_lineage.go` establishes lineage from sibling
+  content overlap anchored on the asymmetric `bg` stamp. Reverified 2026-08-09
+  by fork-resuming a transcript containing a uuid-less `queued_command`
+  attachment: only uuid-bearing chain entries are replayed into the fork;
+  uuid-less records (queued commands, queue-operations, ai-title, mode) never
+  appear in the replay region, so every uuid-less line in a fork transcript is
+  the fork's own. Reverified 2026-08-09 by forking a fully bg-marked transcript
+  with a plain non-bg `--fork-session` process: every replayed line in the new
+  transcript carries no `sessionKind` — the writer re-stamps the current
+  process's kind on each persisted line, overwriting the copied value, so the
+  bg marker reflects the forking process and cannot be inherited through
+  replayed entries. Evidence remains `no-public-source`.
 
 ## OpenClaude (`openclaude`)
 

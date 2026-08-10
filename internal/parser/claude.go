@@ -73,12 +73,29 @@ type claudeQueuedCommand struct {
 func claudeParseWithExclusions(
 	path, project, machine string,
 ) ([]ParseResult, []string, error) {
+	return claudeParseFile(path, project, machine, claudeParseOptions{})
+}
+
+func claudeParseFile(
+	path, project, machine string, opts claudeParseOptions,
+) ([]ParseResult, []string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 
 	sessionID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+
+	// Background-fork lineage: when the transcript is a bg-marked fork
+	// that replays a non-bg sibling, drop the replayed prefix and link
+	// the fork to its parent. Whether the fork is still an exact copy
+	// of the parent is decided after parsing: uuid-less fork-own
+	// records (a prompt queued at handoff) can carry the fork's only
+	// message.
+	var lineage *claudeLineagePlan
+	if opts.siblingLineage {
+		lineage = claudeResolveSiblingLineage(path)
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -103,6 +120,7 @@ func claudeParseWithExclusions(
 		sessionKind     string
 		foundParentSID  bool
 		lineIndex       int
+		uuidLineOrdinal int
 		malformedLines  int
 		lastLineHasData bool
 		lastLineValid   bool
@@ -112,6 +130,9 @@ func claudeParseWithExclusions(
 	)
 	allHaveUUID = true
 	parentSessionID = claudeCompanionParentSessionID(path, sessionID)
+	if lineage != nil {
+		parentSessionID = lineage.parentSessionID
+	}
 
 	lr := newLineReader(f, maxLineSize)
 	defer releaseLineReader(lr)
@@ -129,6 +150,18 @@ func claudeParseWithExclusions(
 			continue
 		}
 		lastLineFailed = false
+
+		// Drop the contiguous leading replay region of a background
+		// fork before any metadata, timestamp, or attachment
+		// collection: replayed records belong to the parent session.
+		if lineage != nil &&
+			gjson.GetBytes(lineBytes, "uuid").Str != "" {
+			ordinal := uuidLineOrdinal
+			uuidLineOrdinal++
+			if ordinal < lineage.dropCount {
+				continue
+			}
+		}
 
 		entryType := gjson.GetBytes(lineBytes, "type").Str
 		if agentLabel == "" {
@@ -257,6 +290,14 @@ func claudeParseWithExclusions(
 
 		uuid := gjson.Get(line, "uuid").Str
 		parentUuid := gjson.Get(line, "parentUuid").Str
+		if lineage != nil && parentUuid != "" {
+			if _, dropped := lineage.dropUUIDs[parentUuid]; dropped {
+				// The replay boundary entry references a dropped
+				// record; re-root it so DAG processing still sees a
+				// single-root chain.
+				parentUuid = ""
+			}
+		}
 
 		if uuid != "" {
 			hasAnyUUID = true
@@ -346,6 +387,13 @@ func claudeParseWithExclusions(
 		results[0] = applyQueuedCommands(results[0], queuedCommands)
 	}
 
+	// An established background-fork lineage is a continuation of the
+	// parent transcript. In-file DAG forks (results[1:]) keep their
+	// fork relationship to the main branch.
+	if lineage != nil && len(results) > 0 {
+		results[0].Session.RelationshipType = RelContinuation
+	}
+
 	// Classify termination status for each result. All forks
 	// from a single file share lastLineFailed because a
 	// truncated tail affects every branch. The stop_reason is
@@ -363,11 +411,16 @@ func claudeParseWithExclusions(
 	// Drop content-free /usage probe sessions (e.g. CodexBar's
 	// ClaudeProbe) after the queued-command splice so both inline
 	// and queued /usage prompts are visible to the check. They never
-	// enter the archive.
+	// enter the archive. A background fork whose trimmed result holds
+	// no messages of its own is still an exact copy of its parent and
+	// is excluded the same way, retiring any previously stored
+	// untrimmed row.
 	kept := results[:0]
 	var excluded []string
 	for _, r := range results {
-		if isUsageProbeSession(r.Messages) {
+		if isUsageProbeSession(r.Messages) ||
+			(lineage != nil && r.Session.ID == sessionID &&
+				len(r.Messages) == 0) {
 			excluded = append(excluded, r.Session.ID)
 			continue
 		}

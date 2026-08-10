@@ -476,6 +476,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentRooCode,
 		AgentPoolside,
 		AgentOmnigent,
+		AgentCodebuff,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))
@@ -690,6 +691,10 @@ func TestPeriodicReconcileCapability(t *testing.T) {
 	// updated_at floor, so metadata-only edits and deletions rely on the
 	// scheduled fingerprint-gated container reparse.
 	assert.True(t, optedIn[AgentOmnigent])
+	// Codebuff's recursive per-project watch covers existing projects;
+	// scheduled reconciliation picks up newly created project
+	// directories under the root (see codebuffWatchRoots).
+	assert.True(t, optedIn[AgentCodebuff])
 	// Cowork's provider WatchPlan registers its root recursively
 	// (coworkWatchRoots Recursive:true overrides legacy ShallowWatch), so
 	// scheduled reconciliation would redundantly rescan the whole archive.
@@ -1339,4 +1344,19 @@ func TestReasonixRegistryEntry(t *testing.T) {
 	}
 	assert.True(t, hasUnix, "DefaultDirs should contain .reasonix")
 	assert.True(t, hasWindows, "DefaultDirs should contain AppData/Roaming/reasonix")
+}
+
+func TestFreebuffNotRegistered(t *testing.T) {
+	// Freebuff intentionally shares the Codebuff provider and is NOT
+	// registered in Registry. Freebuff sessions do carry agent =
+	// AgentFreebuff with freebuff:-prefixed IDs (set by
+	// parseCodebuffSession when run-state.json agentType contains
+	// "free"), but there is no separate registry entry or factory:
+	// sync canonicalizes freebuff onto the Codebuff provider def
+	// (AgentByPrefix maps freebuff: IDs to the Codebuff def), so
+	// lifecycle operations over the shared roots run once.
+	for _, def := range Registry {
+		assert.NotEqualf(t, AgentFreebuff, def.Type,
+			"AgentFreebuff must not be registered — it shares the Codebuff provider")
+	}
 }

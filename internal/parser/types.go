@@ -71,6 +71,8 @@ const (
 	AgentRooCode        AgentType = "roocode"
 	AgentPoolside       AgentType = "poolside"
 	AgentOmnigent       AgentType = "omnigent"
+	AgentCodebuff       AgentType = "codebuff"
+	AgentFreebuff       AgentType = "freebuff"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -894,6 +896,30 @@ var Registry = []AgentDef{
 		// allowlisted export schema.
 		RemoteSyncExcluded: true,
 	},
+	{
+		// Codebuff and Freebuff share the same on-disk layout under
+		// ~/.config/manicode/projects/<project>/chats/<timestamp>/. Each
+		// session directory holds chat-messages.json (primary),
+		// run-state.json (model/token metadata), and chat-meta.json.
+		// Freebuff sessions do carry their own agent type: the parser
+		// sets Agent = AgentFreebuff and emits freebuff:-prefixed IDs
+		// when run-state.json agentType contains "free". Freebuff has
+		// no separate registry entry or provider factory, though; sync
+		// canonicalizes freebuff onto this Codebuff def (AgentByPrefix
+		// maps freebuff: IDs here), which avoids double-discovery and
+		// skip-cache contention over the shared roots.
+		Type:              AgentCodebuff,
+		DisplayName:       "Codebuff",
+		EnvVar:            "CODEBUFF_DIR",
+		ConfigKey:         "codebuff_dirs",
+		DefaultDirs:       []string{".config/manicode/projects"},
+		IDPrefix:          "codebuff:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
 }
 
 // NonFileBackedAgents returns agent types where FileBased is false.
@@ -927,16 +953,23 @@ func RemoteSyncExcludedAgent(agent AgentType) bool {
 // AgentNameLacksPerMessageTokenData reports whether the named agent
 // records no per-message token data. Names match registry types
 // exactly and unknown names fail closed; CSV filter parsing trims its
-// parts before calling.
+// parts before calling. Freebuff is treated as a Codebuff alias.
 func AgentNameLacksPerMessageTokenData(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.NoPerMessageTokenData
 }
 
 // AgentNameUsesAICredits reports whether the named agent's cost is
-// denominated in AI credits rather than USD.
+// denominated in AI credits rather than USD. Freebuff is treated as
+// a Codebuff alias.
 func AgentNameUsesAICredits(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.AICreditsDenominated
 }
 
@@ -1009,6 +1042,16 @@ func StripHostPrefix(id string) (host, rawID string) {
 // stripped before matching.
 func AgentByPrefix(sessionID string) (AgentDef, bool) {
 	_, rawID := StripHostPrefix(sessionID)
+	// Freebuff shares the Codebuff provider but emits sessions with the
+	// "freebuff:" prefix. Return a copy with the freebuff prefix so
+	// callers that strip the prefix (FindSourceFile, ProviderNormalizeRawSessionID)
+	// work correctly.
+	if strings.HasPrefix(rawID, string(AgentFreebuff)+":") {
+		if def, ok := AgentByType(AgentCodebuff); ok {
+			def.IDPrefix = string(AgentFreebuff) + ":"
+			return def, true
+		}
+	}
 	for _, def := range Registry {
 		if def.IDPrefix != "" &&
 			strings.HasPrefix(rawID, def.IDPrefix) {

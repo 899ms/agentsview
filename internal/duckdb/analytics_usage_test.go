@@ -1876,3 +1876,58 @@ func duckHOWMessages(cells []db.HourOfWeekCell, dow, hour int) int {
 	}
 	return -1
 }
+
+// TestDuckDailyUsageEventModelEligibility pins the DuckDB
+// aggregator's usage-event eligibility contract for Codebuff/
+// Freebuff's parser-attributed agent template name. The Codebuff
+// parser (internal/parser/codebuff.go) sets Model = <agentType>
+// (e.g. "base2-deepseek", "base2-free-minimax-m3") rather than the
+// agent name so the per-model breakdown in the usage report stays
+// granular. The aggregate must accept any non-empty Model value and
+// reject empty-model rows: hard-coding an accepted model literal
+// would drop the template-attributed cost (TotalCost falls to zero),
+// and dropping the non-empty-model requirement would leak the
+// empty-model row's cost into TotalCost.
+func TestDuckDailyUsageEventModelEligibility(t *testing.T) {
+	ctx := context.Background()
+	templateCost := money.MustParseDollars("0.05")
+	emptyModelCost := money.MustParseDollars("0.99")
+	sess := syncSession(
+		"codebuff:eligibility", "alpha", "cost only",
+		"2026-07-15T10:00:00.000Z", 0)
+	sess.Agent = "codebuff"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{
+			{
+				Source: "session", Model: "base2-deepseek",
+				Cost: &templateCost, CostStatus: "reported",
+				CostSource: "session",
+				OccurredAt: "2026-07-15T10:05:00Z",
+				DedupKey:   "template-model",
+			},
+			{
+				Source: "session", Model: "",
+				Cost: &emptyModelCost, CostStatus: "reported",
+				CostSource: "session",
+				OccurredAt: "2026-07-15T10:06:00Z",
+				DedupKey:   "empty-model",
+			},
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-07-15", To: "2026-07-15", Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	assert.Equal(t, templateCost, daily.Totals.TotalCost,
+		"the template-model cost must be included and the "+
+			"empty-model cost excluded")
+	require.Len(t, daily.Daily, 1)
+	assert.Equal(t, templateCost, daily.Daily[0].TotalCost)
+	require.Len(t, daily.Daily[0].ModelBreakdowns, 1,
+		"only the template-attributed model may surface")
+	assert.Equal(t, "base2-deepseek",
+		daily.Daily[0].ModelBreakdowns[0].ModelName)
+}

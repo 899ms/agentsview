@@ -202,6 +202,96 @@ func TestPreserveUnavailableSourceProjectsUsesDurableSnapshot(
 	}
 }
 
+// TestPreserveUnavailableSourceProjectsSkipsProtectedPath pins that deciding
+// whether a session's working directory still exists never stats a path in a
+// macOS TCC-protected location. This probe runs for every unresolved local
+// session in a sync batch, so on a first sync it would prompt once per
+// guarded folder before any git metadata is read.
+func TestPreserveUnavailableSourceProjectsSkipsProtectedPath(t *testing.T) {
+	database := openTestDB(t)
+	home := t.TempDir()
+	cwd := filepath.Join(home, "Downloads", "checkout")
+	require.NoError(t, os.MkdirAll(cwd, 0o755))
+	engine := NewEngine(database, EngineConfig{Machine: "test-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+	engine.stat = func(got string) (os.FileInfo, error) {
+		assert.Fail(t, "stat must not touch a protected location", got)
+		return nil, os.ErrNotExist
+	}
+
+	result, err := engine.preserveUnavailableSourceProjects(
+		t.Context(), []pendingWrite{{sess: parser.ParsedSession{
+			ID: "protected-source", Project: "protected-project",
+			Machine: "test-machine", Agent: parser.AgentClaude, Cwd: cwd,
+		}}},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.True(t, result[0].sourceProjectResolved,
+		"an unprobed session must be treated as resolved, not retried")
+	assert.Equal(t, "protected-project", result[0].sess.Project)
+}
+
+// TestPreserveUnavailableSourceProjectsSkipsProtectedSnapshotRoot pins that
+// containment against a durable snapshot's root never resolves symlinks
+// inside a guarded folder: the session cwd is vetted upstream, but the
+// snapshot root is stored data that can predate protected-path gating. A
+// refused root falls back to lexical containment, so the reconciliation
+// completes without EvalSymlinks ever walking the guarded path.
+func TestPreserveUnavailableSourceProjectsSkipsProtectedSnapshotRoot(t *testing.T) {
+	database := openTestDB(t)
+	home := t.TempDir()
+	protectedRoot := filepath.Join(home, "Documents", "proj")
+	cwd := filepath.Join(home, "src", "gone")
+	const sessionID = "protected-snapshot-source"
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: sessionID, Project: "snapshot-project",
+		Machine: "test-machine", Agent: string(parser.AgentClaude), Cwd: cwd,
+	}))
+	require.NoError(t,
+		database.UpsertProjectIdentityObservationWithSnapshotProject(
+			t.Context(), export.ProjectIdentityObservation{
+				SessionID: sessionID, Project: "snapshot-project",
+				Machine: "test-machine", RootPath: protectedRoot,
+				GitRemote:        "https://example.com/team/project.git",
+				RemoteResolution: export.ProjectResolutionResolved,
+				ObservedAt: time.Date(
+					2026, 8, 9, 12, 0, 0, 0, time.UTC,
+				),
+			}, "snapshot-project",
+		))
+	engine := NewEngine(database, EngineConfig{Machine: "test-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	origEval := evalSymlinks
+	t.Cleanup(func() { evalSymlinks = origEval })
+	evalSymlinks = func(path string) (string, error) {
+		if strings.HasPrefix(path, filepath.Join(home, "Documents")) {
+			assert.Fail(t, "a protected snapshot root must not be resolved", path)
+		}
+		return origEval(path)
+	}
+
+	result, err := engine.preserveUnavailableSourceProjects(
+		t.Context(), []pendingWrite{{sess: parser.ParsedSession{
+			ID: sessionID, Project: "parser-fallback",
+			Machine: "test-machine", Agent: parser.AgentClaude, Cwd: cwd,
+		}}},
+	)
+
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.True(t, result[0].sourceProjectResolved)
+	assert.Equal(t, "parser-fallback", result[0].sess.Project,
+		"a refused snapshot root that does not contain the cwd lexically "+
+			"must leave the parsed project untouched")
+}
+
 func TestWriteBatchRelabelRecoversUnavailableSourceProject(t *testing.T) {
 	const (
 		sessionID       = "relabel-unavailable-source"
@@ -5516,6 +5606,480 @@ func TestProjectIdentityObservationSkipsDiscoveryForRemoteMachine(t *testing.T) 
 		"foreign-machine cwd must not be probed for a local git identity")
 	assert.Equal(t, cwd, observations[0].RootPath,
 		"root path must stay the raw cwd, not a locally resolved git root")
+}
+
+// protectedPathIdentityRepo builds a git repo with an origin remote under
+// <home>/Documents and returns the fake home plus the session cwd inside it.
+func protectedPathIdentityRepo(t *testing.T) (home, cwd string) {
+	t.Helper()
+	home = t.TempDir()
+	root := filepath.Join(home, "Documents", "proj")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, ".git", "config"),
+		[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/docs.git\n"),
+		0o644,
+	))
+	cwd = filepath.Join(root, "subdir")
+	require.NoError(t, os.Mkdir(cwd, 0o755))
+	return home, cwd
+}
+
+// TestProjectIdentityObservationSkipsProtectedPathByDefault pins that a cwd
+// inside a macOS TCC-protected location is never probed on disk. Probing it
+// makes macOS raise a consent prompt for Documents during the first sync,
+// which is what issue #1364 reported. The cwd here is a real git repo, so a
+// discovered remote would prove the filesystem was read.
+func TestProjectIdentityObservationSkipsProtectedPathByDefault(t *testing.T) {
+	database := openTestDB(t)
+	home, cwd := protectedPathIdentityRepo(t)
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-protected-skip", Project: "protected-project",
+			Machine: "current-machine", Agent: "codex", Cwd: cwd,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"protected-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Empty(t, observations[0].GitRemote,
+		"a protected-location cwd must not be probed for a git identity")
+	assert.Equal(t, cwd, observations[0].RootPath,
+		"root path must stay the raw cwd, not a resolved git root")
+}
+
+// TestProjectIdentityObservationSkipsSymlinkedProtectedCwd pins that a cwd
+// reaching a protected location only through a symlink is refused too: a
+// lexical-only gate would pass it, and the discovery's own EvalSymlinks and
+// git reads would then enter the protected folder.
+func TestProjectIdentityObservationSkipsSymlinkedProtectedCwd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the probe classifier walks POSIX paths and symlinks")
+	}
+	database := openTestDB(t)
+	home, _ := protectedPathIdentityRepo(t)
+	require.NoError(t, os.Symlink(
+		filepath.Join(home, "Documents"), filepath.Join(home, "code"),
+	))
+	cwd := filepath.Join(home, "code", "proj", "subdir")
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-protected-symlink", Project: "symlinked-project",
+			Machine: "current-machine", Agent: "codex", Cwd: cwd,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"symlinked-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Empty(t, observations[0].GitRemote,
+		"a cwd symlinked into a protected location must not be probed")
+	assert.Equal(t, cwd, observations[0].RootPath,
+		"root path must stay the raw cwd, not a resolved protected root")
+}
+
+// TestMayProbeLocalPathRefusesAutomountDespiteOptIn pins that
+// scan_protected_paths lifts only the protected-folder restriction: an
+// automounter-namespace path — named directly or reached through a symlink —
+// stays refused, because consenting to macOS consent prompts is not
+// consenting to waking automountd on every identity-cache miss.
+func TestMayProbeLocalPathRefusesAutomountDespiteOptIn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the probe classifier walks POSIX paths and symlinks")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.Symlink("/home", filepath.Join(home, "tohome")))
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		Machine: "current-machine", ScanProtectedPaths: true,
+	})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	assert.False(t, engine.mayProbeLocalPath("/home/user/repo"),
+		"a literal automount path must stay refused under the opt-in")
+	assert.False(t, engine.mayProbeLocalPath(
+		filepath.Join(home, "tohome", "user", "repo"),
+	), "a symlink into the automount namespace must stay refused too")
+	assert.True(t, engine.mayProbeLocalPath(
+		filepath.Join(home, "Documents", "proj"),
+	), "the opt-in must still lift the protected-folder restriction")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "Documents"), 0o755))
+	require.NoError(t, os.Symlink(
+		"/home/user", filepath.Join(home, "Documents", "hidden"),
+	))
+	assert.False(t, engine.mayProbeLocalPath(
+		filepath.Join(home, "Documents", "hidden", "repo"),
+	), "an automount target hidden behind a protected prefix stays refused")
+}
+
+// TestProjectIdentityObservationSkipsProtectedGitdirTarget pins that a linked
+// worktree in an unguarded directory whose .git file targets a gitdir inside
+// a protected folder yields no git detail: reading commondir, config, or
+// HEAD from that target would raise the consent prompt the cwd gate
+// prevented. The worktree relationship stays unknown because classifying it
+// requires the refused commondir read.
+func TestProjectIdentityObservationSkipsProtectedGitdirTarget(t *testing.T) {
+	database := openTestDB(t)
+	home := t.TempDir()
+	mainGitDir := filepath.Join(home, "Documents", "main", ".git")
+	worktreeGitDir := filepath.Join(mainGitDir, "worktrees", "wt")
+	require.NoError(t, os.MkdirAll(worktreeGitDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(worktreeGitDir, "commondir"), []byte("../..\n"), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(mainGitDir, "config"),
+		[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/docs.git\n"),
+		0o644,
+	))
+	worktree := filepath.Join(home, "src", "wt")
+	require.NoError(t, os.MkdirAll(worktree, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(worktree, ".git"),
+		[]byte("gitdir: "+worktreeGitDir+"\n"), 0o644,
+	))
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-protected-gitdir", Project: "gitdir-project",
+			Machine: "current-machine", Agent: "codex", Cwd: worktree,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"gitdir-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Empty(t, observations[0].GitRemote,
+		"a protected gitdir target must not be read for remotes")
+	assert.Equal(t, export.WorktreeUnknown,
+		observations[0].WorktreeRelationship,
+		"classifying the worktree requires the refused commondir read")
+}
+
+// TestProjectIdentityObservationSkipsSymlinkedGitDir pins that a .git entry
+// which is itself a symlink into a protected folder is refused before being
+// read: the type probe would follow the link, and the HEAD and config reads
+// under the returned git directory would traverse into the protected
+// location. The link target is a real git directory with a branch and a
+// remote, so a missing vet is caught by either leaking into the observation.
+func TestProjectIdentityObservationSkipsSymlinkedGitDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the probe classifier walks POSIX paths and symlinks")
+	}
+	database := openTestDB(t)
+	home := t.TempDir()
+	realGit := filepath.Join(home, "Documents", "main", ".git")
+	require.NoError(t, os.MkdirAll(realGit, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(realGit, "HEAD"),
+		[]byte("ref: refs/heads/docs-branch\n"), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(realGit, "config"),
+		[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/docs.git\n"),
+		0o644,
+	))
+	repo := filepath.Join(home, "src", "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	require.NoError(t, os.Symlink(realGit, filepath.Join(repo, ".git")))
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-symlinked-gitdir", Project: "gitlink-project",
+			Machine: "current-machine", Agent: "codex", Cwd: repo,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"gitlink-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Empty(t, observations[0].GitRemote,
+		"config must not be read through a protected .git symlink")
+	assert.Empty(t, observations[0].GitBranch,
+		"HEAD must not be read through a protected .git symlink")
+}
+
+// TestProjectIdentityObservationSkipsProtectedCommonDir pins the second hop
+// of the same leak: a gitfile target outside protected folders whose
+// commondir points into one. The gitdir itself may be read, but the common
+// directory's config must not be.
+func TestProjectIdentityObservationSkipsProtectedCommonDir(t *testing.T) {
+	database := openTestDB(t)
+	home := t.TempDir()
+	protectedGit := filepath.Join(home, "Documents", "main", ".git")
+	require.NoError(t, os.MkdirAll(protectedGit, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(protectedGit, "config"),
+		[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/docs.git\n"),
+		0o644,
+	))
+	gitDir := filepath.Join(home, "gitstore", "wt-git")
+	require.NoError(t, os.MkdirAll(gitDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(gitDir, "commondir"), []byte(protectedGit+"\n"), 0o644,
+	))
+	worktree := filepath.Join(home, "src", "wt")
+	require.NoError(t, os.MkdirAll(worktree, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(worktree, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644,
+	))
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-protected-commondir", Project: "commondir-project",
+			Machine: "current-machine", Agent: "codex", Cwd: worktree,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"commondir-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Empty(t, observations[0].GitRemote,
+		"a protected common directory must not be read for remotes")
+}
+
+// TestProjectIdentityObservationSkipsSymlinkedMetadataFiles pins that the
+// exact metadata-file paths are vetted before reading: HEAD, config, and
+// commondir sit inside vetted directories, but as symlinks they can lead
+// into a protected folder, and reading through one would raise the consent
+// prompt every directory-level vet already prevented. Each protected target
+// holds real git data, so a missing vet is caught by that data leaking into
+// the observation.
+func TestProjectIdentityObservationSkipsSymlinkedMetadataFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the probe classifier walks POSIX paths and symlinks")
+	}
+	tests := []struct {
+		name  string
+		build func(t *testing.T, home, gitDir string)
+		check func(t *testing.T, obs export.ProjectIdentityObservation)
+	}{
+		{
+			name: "HEAD symlink",
+			build: func(t *testing.T, home, gitDir string) {
+				t.Helper()
+				target := filepath.Join(home, "Documents", "head-target")
+				require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+				require.NoError(t, os.WriteFile(
+					target, []byte("ref: refs/heads/leak-branch\n"), 0o644,
+				))
+				require.NoError(t, os.Symlink(
+					target, filepath.Join(gitDir, "HEAD"),
+				))
+			},
+			check: func(t *testing.T, obs export.ProjectIdentityObservation) {
+				t.Helper()
+				assert.Empty(t, obs.GitBranch,
+					"HEAD must not be read through a protected symlink")
+			},
+		},
+		{
+			name: "config symlink",
+			build: func(t *testing.T, home, gitDir string) {
+				t.Helper()
+				target := filepath.Join(home, "Documents", "config-target")
+				require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+				require.NoError(t, os.WriteFile(
+					target,
+					[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/leak.git\n"),
+					0o644,
+				))
+				require.NoError(t, os.Symlink(
+					target, filepath.Join(gitDir, "config"),
+				))
+			},
+			check: func(t *testing.T, obs export.ProjectIdentityObservation) {
+				t.Helper()
+				assert.Empty(t, obs.GitRemote,
+					"config must not be read through a protected symlink")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database := openTestDB(t)
+			home := t.TempDir()
+			repo := filepath.Join(home, "src", "repo")
+			gitDir := filepath.Join(repo, ".git")
+			require.NoError(t, os.MkdirAll(gitDir, 0o755))
+			tt.build(t, home, gitDir)
+			engine := NewEngine(database, EngineConfig{
+				Machine: "current-machine",
+			})
+			t.Cleanup(engine.Close)
+			engine.goos = "darwin"
+			engine.homeDir = home
+
+			project := "meta-" + strings.ReplaceAll(tt.name, " ", "-")
+			require.NoError(t, engine.writeProjectIdentityObservation(
+				t.Context(), db.Session{
+					ID: "identity-" + project, Project: project,
+					Machine: "current-machine", Agent: "codex", Cwd: repo,
+					StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+				},
+			))
+
+			observations, err := database.ListProjectIdentityObservations(
+				t.Context(), []string{project},
+			)
+			require.NoError(t, err)
+			require.Len(t, observations, 1)
+			tt.check(t, observations[0])
+		})
+	}
+}
+
+// TestProjectIdentityObservationSkipsSymlinkedCommondirFile pins the same
+// vet for the commondir file inside a linked worktree's gitdir: reading it
+// through a protected symlink would both touch the protected folder and
+// misclassify the worktree as linked.
+func TestProjectIdentityObservationSkipsSymlinkedCommondirFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the probe classifier walks POSIX paths and symlinks")
+	}
+	database := openTestDB(t)
+	home := t.TempDir()
+	gitStore := filepath.Join(home, "gitstore", "wt-git")
+	require.NoError(t, os.MkdirAll(gitStore, 0o755))
+	target := filepath.Join(home, "Documents", "commondir-target")
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+	require.NoError(t, os.WriteFile(target, []byte("../..\n"), 0o644))
+	require.NoError(t, os.Symlink(
+		target, filepath.Join(gitStore, "commondir"),
+	))
+	worktree := filepath.Join(home, "src", "wt")
+	require.NoError(t, os.MkdirAll(worktree, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(worktree, ".git"),
+		[]byte("gitdir: "+gitStore+"\n"), 0o644,
+	))
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-commondir-link", Project: "commondir-link-project",
+			Machine: "current-machine", Agent: "codex", Cwd: worktree,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"commondir-link-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Equal(t, export.WorktreeMain, observations[0].WorktreeRelationship,
+		"an unread commondir must leave the gitdir classified as main")
+}
+
+// TestProjectIdentityObservationScansProtectedPathWhenOptedIn pins that
+// scan_protected_paths restores full git identity for users who keep code in
+// Documents and accept the macOS prompt.
+func TestProjectIdentityObservationScansProtectedPathWhenOptedIn(t *testing.T) {
+	database := openTestDB(t)
+	home, cwd := protectedPathIdentityRepo(t)
+	engine := NewEngine(database, EngineConfig{
+		Machine: "current-machine", ScanProtectedPaths: true,
+	})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-protected-optin", Project: "protected-optin-project",
+			Machine: "current-machine", Agent: "codex", Cwd: cwd,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"protected-optin-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Equal(t, "https://github.com/acme/docs.git",
+		observations[0].GitRemote,
+		"opting in must restore git discovery inside protected locations")
+}
+
+// TestProjectIdentityObservationScansUnprotectedPath pins that the protected
+// -path gate does not disturb the ordinary case: a cwd outside the guarded
+// locations still gets full git identity with the default configuration.
+func TestProjectIdentityObservationScansUnprotectedPath(t *testing.T) {
+	database := openTestDB(t)
+	home := t.TempDir()
+	root := filepath.Join(home, "src", "proj")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, ".git", "config"),
+		[]byte("[remote \"origin\"]\n\turl = https://github.com/acme/src.git\n"),
+		0o644,
+	))
+	engine := NewEngine(database, EngineConfig{Machine: "current-machine"})
+	t.Cleanup(engine.Close)
+	engine.goos = "darwin"
+	engine.homeDir = home
+
+	require.NoError(t, engine.writeProjectIdentityObservation(
+		t.Context(), db.Session{
+			ID: "identity-unprotected", Project: "unprotected-project",
+			Machine: "current-machine", Agent: "codex", Cwd: root,
+			StartedAt: strPtr(time.Now().UTC().Format(time.RFC3339Nano)),
+		},
+	))
+
+	observations, err := database.ListProjectIdentityObservations(
+		t.Context(), []string{"unprotected-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Equal(t, "https://github.com/acme/src.git",
+		observations[0].GitRemote,
+		"paths outside protected locations must still be discovered")
 }
 
 func TestProjectIdentityObservationDiscoversForLegacyLocalMachine(t *testing.T) {

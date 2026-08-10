@@ -271,6 +271,14 @@ type EngineConfig struct {
 	// remote sync leaves it empty because the prefixes describe
 	// local paths.
 	IncludeCwdPrefixes []string
+	// ScanProtectedPaths lets local Git discovery read working directories
+	// inside macOS TCC-protected locations (Documents, Downloads, Desktop,
+	// iCloud Drive, and cloud-provider folders). It defaults to false so a
+	// first sync cannot raise consent prompts the user cannot explain;
+	// sessions there keep path-only project identity. Populated from the
+	// scan_protected_paths config option. The safe default belongs to the
+	// zero value so an engine built without the option never prompts.
+	ScanProtectedPaths bool
 	// IDPrefix is prepended to all session IDs. Used by
 	// remote sync to namespace IDs by host (e.g. "host~").
 	IDPrefix string
@@ -318,11 +326,18 @@ type Engine struct {
 	machine                 string
 	blockedResultCategories map[string]bool
 	cwdFilter               cwdPrefixFilter
-	syncMu                  gosync.Mutex // serializes all sync operations
-	mu                      gosync.RWMutex
-	lastSync                time.Time
-	lastSyncStats           SyncStats
-	currentProgress         *Progress
+	// scanProtectedPaths, homeDir, and goos gate passive probing of macOS
+	// TCC-protected locations. homeDir is empty when the home directory
+	// cannot be resolved, which disables the gate rather than guessing.
+	// goos mirrors runtime.GOOS so the gate is testable off-darwin.
+	scanProtectedPaths bool
+	homeDir            string
+	goos               string
+	syncMu             gosync.Mutex // serializes all sync operations
+	mu                 gosync.RWMutex
+	lastSync           time.Time
+	lastSyncStats      SyncStats
+	currentProgress    *Progress
 	// skipCache tracks paths that should be skipped on
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
@@ -612,6 +627,15 @@ func NewEngine(
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
 
+	if cfg.ScanProtectedPaths {
+		// Parsers extract project names by probing recorded cwds for git
+		// roots; that guard is package-level because extraction runs deep
+		// inside per-format code with no engine to consult. The opt-in only
+		// ever enables it: engines built without the option (remote sync,
+		// the identity backfill) must not revoke the user's process-wide
+		// choice.
+		parser.SetAllowProtectedPathProbes(true)
+	}
 	e := &Engine{
 		db:                      database,
 		stat:                    os.Stat,
@@ -621,6 +645,9 @@ func NewEngine(
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		cwdFilter:               newCwdPrefixFilter(cfg.IncludeCwdPrefixes),
+		scanProtectedPaths:      cfg.ScanProtectedPaths,
+		homeDir:                 userHomeDirOrEmpty(),
+		goos:                    runtime.GOOS,
 		skipCache:               skipCache,
 		skipFingerprints:        make(map[string]string),
 		skipHashKeys:            skipHashKeys,
@@ -11965,6 +11992,27 @@ func (e *Engine) loadWorktreeProjectResolver() worktreeProjectResolver {
 	}
 }
 
+// skipSourceProjectProbe reports whether pw's working directory must not be
+// stat-ed to decide whether its source project is still available. Remote and
+// unverified sessions describe another machine's paths, automounter namespaces
+// wake automountd, and macOS TCC-protected locations raise a consent prompt.
+// Skipping leaves the stored project untouched, which is what an unreachable
+// working directory would produce anyway.
+func (e *Engine) skipSourceProjectProbe(pw *pendingWrite) bool {
+	sess := &pw.sess
+	if sess.ID == "" || sess.Cwd == "" || pw.sourceIdentityUnverified {
+		return true
+	}
+	if !e.isLocalMachineAttribution(sess.Machine) ||
+		!safeLocalAbsolutePath(sess.Cwd) {
+		return true
+	}
+	if export.IsAutomountNamespacePath(runtime.GOOS, filepath.Clean(sess.Cwd)) {
+		return true
+	}
+	return !e.mayProbeLocalPath(sess.Cwd)
+}
+
 func (e *Engine) preserveUnavailableSourceProjects(
 	ctx context.Context,
 	batch []pendingWrite,
@@ -11976,11 +12024,7 @@ func (e *Engine) preserveUnavailableSourceProjects(
 			continue
 		}
 		sess := batch[i].sess
-		if sess.ID == "" || sess.Cwd == "" ||
-			batch[i].sourceIdentityUnverified ||
-			!e.isLocalMachineAttribution(sess.Machine) ||
-			!safeLocalAbsolutePath(sess.Cwd) ||
-			export.IsAutomountNamespacePath(runtime.GOOS, filepath.Clean(sess.Cwd)) {
+		if e.skipSourceProjectProbe(&batch[i]) {
 			batch[i].sourceProjectResolved = true
 			continue
 		}
@@ -12024,13 +12068,46 @@ func (e *Engine) preserveUnavailableSourceProjects(
 		for _, i := range indexes[id] {
 			sess := &batch[i].sess
 			if !e.sameLocalMachineAttribution(snapshot.Machine, sess.Machine) ||
-				!pathContains(snapshot.RootPath, sess.Cwd) {
+				!e.snapshotRootContainsCwd(snapshot.RootPath, sess.Cwd) {
 				continue
 			}
 			sess.Project = snapshot.Project
 		}
 	}
 	return batch, nil
+}
+
+// userHomeDirOrEmpty returns the current user's home directory, or "" when it
+// cannot be resolved. An empty result leaves protected-path gating inactive,
+// which keeps discovery working on systems with no usable home directory.
+func userHomeDirOrEmpty() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
+}
+
+// mayProbeLocalPath reports whether passive discovery may touch p on disk.
+// Working directories inside macOS TCC-protected locations stay untouched
+// unless the user set scan_protected_paths, so importing an archive cannot
+// raise consent prompts for Documents, Downloads, or a cloud-provider folder.
+// Automounter namespaces stay untouched regardless of the opt-in: consenting
+// to consent prompts is not consenting to waking automountd. The check
+// follows symlinks, so a path that merely links into either kind of location
+// is refused before Stat or EvalSymlinks can enter it.
+func (e *Engine) mayProbeLocalPath(p string) bool {
+	switch export.ClassifyLocalPathProbe(
+		e.goos, e.homeDir, p, e.scanProtectedPaths,
+	) {
+	case export.LocalPathProbeAutomountNamespace:
+		return false
+	case export.LocalPathProbeProtectedUserData:
+		return e.scanProtectedPaths
+	case export.LocalPathProbeSafe:
+		return true
+	}
+	return true
 }
 
 // isLocalMachineAttribution recognizes empty and the legacy "local" sentinel
@@ -12044,10 +12121,26 @@ func (e *Engine) sameLocalMachineAttribution(left, right string) bool {
 		(e.isLocalMachineAttribution(left) && e.isLocalMachineAttribution(right))
 }
 
+// snapshotRootContainsCwd reports whether the durable snapshot's root
+// contains the session cwd. The cwd was vetted by skipSourceProjectProbe,
+// but the snapshot root is stored data that can predate protected-path
+// gating and name a guarded folder; resolving its symlinks would walk
+// inside it, so a refused root falls back to lexical containment.
+func (e *Engine) snapshotRootContainsCwd(root, cwd string) bool {
+	if !e.mayProbeLocalPath(root) {
+		return lexicalPathContains(root, cwd)
+	}
+	return pathContains(root, cwd)
+}
+
 func pathContains(root, path string) bool {
 	root = resolveExistingPathPrefix(root)
 	path = resolveExistingPathPrefix(path)
-	rel, err := filepath.Rel(root, path)
+	return lexicalPathContains(root, path)
+}
+
+func lexicalPathContains(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
 	if err != nil {
 		return false
 	}
@@ -12055,12 +12148,17 @@ func pathContains(root, path string) bool {
 		(rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
+// evalSymlinks is indirected through a var so tests can assert prefix
+// resolution never walks a refused root. Production code always uses
+// filepath.EvalSymlinks via this binding.
+var evalSymlinks = filepath.EvalSymlinks
+
 func resolveExistingPathPrefix(path string) string {
 	cleaned := filepath.Clean(path)
 	current := cleaned
 	var missingTail []string
 	for {
-		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+		if resolved, err := evalSymlinks(current); err == nil {
 			for _, v := range slices.Backward(missingTail) {
 				resolved = filepath.Join(resolved, v)
 			}
@@ -13204,7 +13302,9 @@ func (e *Engine) projectIdentityObservation(
 	if obs.GitBranch != "" {
 		obs.CheckoutState = export.CheckoutBranch
 	} else {
-		obs.CheckoutState, obs.GitBranch = readGitCheckout(cached.gitDir)
+		obs.CheckoutState, obs.GitBranch = readGitCheckout(
+			cached.gitDir, e.mayProbeLocalPath,
+		)
 	}
 	return obs, true
 }
@@ -13238,12 +13338,16 @@ func (e *Engine) cachedProjectIdentity(machine, rootPath string) projectIdentity
 	// wakes the /home automounter — with tens of thousands of remote
 	// sessions and a one-minute cache TTL that becomes a sustained
 	// automountd/opendirectoryd CPU storm.
+	// mayProbeLocalPath also guards export.NormalizeRootPath below, which
+	// resolves symlinks and would reach into a protected location on its own.
 	if e.idPrefix == "" && e.pathRewriter == nil &&
-		e.isLocalMachineAttribution(machine) {
+		e.isLocalMachineAttribution(machine) && e.mayProbeLocalPath(rootPath) {
 		if normalized, ok, err := export.NormalizeRootPath(rootPath); err == nil && ok {
 			identity.rootPath = normalized
 		}
-		if discovered := discoverLocalGitIdentity(rootPath); discovered.rootPath != "" {
+		if discovered := discoverLocalGitIdentity(
+			rootPath, e.mayProbeLocalPath,
+		); discovered.rootPath != "" {
 			identity.rootPath = discovered.rootPath
 			identity.repositoryPath = discovered.repositoryPath
 			identity.gitDir = discovered.gitDir
@@ -13371,7 +13475,9 @@ func countNormalizedRemoteCandidates(remotes map[string]string) int {
 	return len(unique)
 }
 
-func discoverLocalGitIdentity(cwd string) localGitIdentity {
+func discoverLocalGitIdentity(
+	cwd string, mayProbe func(string) bool,
+) localGitIdentity {
 	if !safeLocalAbsolutePath(cwd) {
 		return localGitIdentity{}
 	}
@@ -13385,19 +13491,26 @@ func discoverLocalGitIdentity(cwd string) localGitIdentity {
 	if err != nil {
 		return localGitIdentity{}
 	}
-	root := findLocalGitRoot(resolved)
+	root := findLocalGitRoot(resolved, mayProbe)
 	if root == "" {
 		return localGitIdentity{}
 	}
-	gitDir, commonDir, relationship := gitDirectoryContext(root)
+	gitDir, commonDir, relationship := gitDirectoryContext(root, mayProbe)
 	result := localGitIdentity{
 		rootPath:       root,
-		repositoryPath: repositoryPathForGitContext(root, commonDir),
+		repositoryPath: repositoryPathForGitContext(root, commonDir, mayProbe),
 		gitDir:         gitDir,
 		worktreeKind:   relationship,
 	}
+	// The common directory comes from gitfile contents and can point
+	// anywhere, including a protected location the vetted cwd never named,
+	// and the config file inside a vetted one can itself be a symlink out;
+	// vetting the exact file path covers both.
 	if commonDir != "" {
-		result.remotes = readGitRemotes(filepath.Join(commonDir, "config"))
+		configPath := filepath.Join(commonDir, "config")
+		if mayProbe(configPath) {
+			result.remotes = readGitRemotes(configPath)
+		}
 	}
 	return result
 }
@@ -13436,13 +13549,11 @@ func looksWindowsDrivePath(p string) bool {
 	return p[2] == '\\' || p[2] == '/'
 }
 
-func findLocalGitRoot(start string) string {
+func findLocalGitRoot(start string, mayProbe func(string) bool) string {
 	dir := filepath.Clean(start)
 	for {
-		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			if info.IsDir() || info.Mode().IsRegular() {
-				return dir
-			}
+		if gitEntryMarksRoot(filepath.Join(dir, ".git"), mayProbe) {
+			return dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -13452,10 +13563,40 @@ func findLocalGitRoot(start string) string {
 	}
 }
 
+// gitEntryMarksRoot reports whether gitPath denotes a git directory or
+// gitfile, following a symlink only when its target passes mayProbe. A
+// refused link still marks a root: it is a repo boundary we must not look
+// through, and gitDirectoryContext refuses the reads under it.
+func gitEntryMarksRoot(gitPath string, mayProbe func(string) bool) bool {
+	info, err := os.Lstat(gitPath)
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !mayProbe(gitPath) {
+			return true
+		}
+		followed, err := os.Stat(gitPath)
+		if err != nil {
+			return false
+		}
+		return followed.IsDir() || followed.Mode().IsRegular()
+	}
+	return info.IsDir() || info.Mode().IsRegular()
+}
+
 func gitDirectoryContext(
-	root string,
+	root string, mayProbe func(string) bool,
 ) (gitDir, commonDir string, relationship export.WorktreeRelationship) {
 	gitPath := filepath.Join(root, ".git")
+	// root is vetted, but the .git entry itself can be a symlink into a
+	// guarded location; classification follows links, so vetting the exact
+	// path keeps both the type probe and the gitfile read (and every later
+	// HEAD, config, and commondir read under the returned directories)
+	// from traversing into it.
+	if !mayProbe(gitPath) {
+		return "", "", export.WorktreeUnknown
+	}
 	if info, err := os.Stat(gitPath); err == nil && info.IsDir() {
 		return gitPath, gitPath, export.WorktreeMain
 	}
@@ -13472,9 +13613,23 @@ func gitDirectoryContext(
 	if !filepath.IsAbs(line) {
 		line = filepath.Join(root, line)
 	}
+	// The gitfile target comes from file contents, not from the vetted
+	// cwd: a linked worktree in an unguarded directory can point at a
+	// main repository inside a protected folder, and reading commondir or
+	// HEAD there would raise the consent prompt the cwd gate prevented.
+	if !mayProbe(line) {
+		return "", "", export.WorktreeUnknown
+	}
 	commonDir = line
 	relationship = export.WorktreeMain
-	if data, err := os.ReadFile(filepath.Join(line, "commondir")); err == nil {
+	// The commondir file sits inside the vetted gitdir, but as a symlink
+	// it can lead anywhere; vet the exact path (classification follows
+	// links) before reading through it.
+	commondirPath := filepath.Join(line, "commondir")
+	if !mayProbe(commondirPath) {
+		return filepath.Clean(line), filepath.Clean(commonDir), relationship
+	}
+	if data, err := os.ReadFile(commondirPath); err == nil {
 		common := strings.TrimSpace(string(data))
 		if filepath.IsAbs(common) {
 			commonDir = common
@@ -13486,12 +13641,19 @@ func gitDirectoryContext(
 	return filepath.Clean(line), filepath.Clean(commonDir), relationship
 }
 
-func repositoryPathForGitContext(root, commonDir string) string {
+func repositoryPathForGitContext(
+	root, commonDir string, mayProbe func(string) bool,
+) string {
 	repositoryPath := commonDir
 	if commonDir == "" {
 		repositoryPath = root
 	} else if filepath.Base(commonDir) == ".git" {
 		repositoryPath = filepath.Dir(commonDir)
+	}
+	// Storing the path string is harmless; resolving its symlinks is a
+	// filesystem walk that must respect the protected-path policy.
+	if !mayProbe(repositoryPath) {
+		return filepath.Clean(repositoryPath)
 	}
 	if resolved, err := filepath.EvalSymlinks(repositoryPath); err == nil {
 		return resolved
@@ -13499,11 +13661,19 @@ func repositoryPathForGitContext(root, commonDir string) string {
 	return filepath.Clean(repositoryPath)
 }
 
-func readGitCheckout(gitDir string) (export.CheckoutState, string) {
+func readGitCheckout(
+	gitDir string, mayProbe func(string) bool,
+) (export.CheckoutState, string) {
 	if gitDir == "" {
 		return export.CheckoutUnknown, ""
 	}
-	data, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	// HEAD sits inside the vetted git directory, but as a symlink it can
+	// lead anywhere; vet the exact path before reading through it.
+	headPath := filepath.Join(gitDir, "HEAD")
+	if !mayProbe(headPath) {
+		return export.CheckoutUnknown, ""
+	}
+	data, err := os.ReadFile(headPath)
 	if err != nil {
 		return export.CheckoutUnknown, ""
 	}

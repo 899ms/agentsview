@@ -18,6 +18,7 @@ describe("KNOWN_AGENTS", () => {
       "copilot",
       "devin",
       "gemini",
+      "gemini-apps",
       "opencode",
       "kilo",
       "kilo-legacy",

@@ -1654,29 +1654,33 @@ func (p *codexProvider) parseSessionSnapshot(
 	}
 
 	sessionName := ""
+	sessionNamePresent := false
 	if p.spec.agent == AgentCodex {
-		sessionName = LookupCodexThreadName(path, b.sessionID)
+		sessionName, sessionNamePresent = LookupCodexThreadNameEntry(
+			path, b.sessionID,
+		)
 	}
-	if sessionName == "" && b.firstMessage == "" &&
+	if !sessionNamePresent && sessionName == "" && b.firstMessage == "" &&
 		b.relationshipType == RelSubagent {
 		sessionName = codexAgentPathLeaf(b.agentPath)
 	}
 
 	sess := &ParsedSession{
-		ID:                sessionID,
-		Project:           b.project,
-		Machine:           machine,
-		Agent:             AgentCodex,
-		ParentSessionID:   b.parentSessionID,
-		RelationshipType:  b.relationshipType,
-		Cwd:               b.cwd,
-		FirstMessage:      b.firstMessage,
-		SessionName:       sessionName,
-		StartedAt:         b.startedAt,
-		EndedAt:           b.endedAt,
-		MessageCount:      len(b.messages),
-		UserMessageCount:  userCount,
-		TerminationStatus: classifyCodexTermination(b.lastTaskEvent),
+		ID:                 sessionID,
+		Project:            b.project,
+		Machine:            machine,
+		Agent:              AgentCodex,
+		ParentSessionID:    b.parentSessionID,
+		RelationshipType:   b.relationshipType,
+		Cwd:                b.cwd,
+		FirstMessage:       b.firstMessage,
+		SessionName:        sessionName,
+		SessionNamePresent: sessionNamePresent,
+		StartedAt:          b.startedAt,
+		EndedAt:            b.endedAt,
+		MessageCount:       len(b.messages),
+		UserMessageCount:   userCount,
+		TerminationStatus:  classifyCodexTermination(b.lastTaskEvent),
 		File: FileInfo{
 			Path:   path,
 			Size:   info.Size(),
@@ -1737,18 +1741,31 @@ func EvictCodexSessionIndexForSession(sessionPath string) {
 // LookupCodexThreadName returns the current Codex thread name for a session
 // from the session_index.jsonl file next to the session root.
 func LookupCodexThreadName(sessionPath, sessionID string) string {
+	name, _ := LookupCodexThreadNameEntry(sessionPath, sessionID)
+	return name
+}
+
+// LookupCodexThreadNameEntry returns the session_index.jsonl title for the
+// session and whether the index actually holds an entry for it. A missing or
+// unreadable index, or an index without this session, reports ok=false so
+// callers can distinguish "renamed to empty" from "no rename signal at all" —
+// modern Codex releases no longer write session_index.jsonl.
+func LookupCodexThreadNameEntry(
+	sessionPath, sessionID string,
+) (string, bool) {
 	if strings.TrimSpace(sessionID) == "" {
-		return ""
+		return "", false
 	}
 	indexPath := codexSessionIndexPath(sessionPath)
 	if indexPath == "" {
-		return ""
+		return "", false
 	}
 	titles, err := loadCodexSessionIndex(indexPath)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	return strings.TrimSpace(titles[sessionID])
+	title, ok := titles[sessionID]
+	return strings.TrimSpace(title), ok
 }
 
 // CodexEffectiveMtime returns the effective mtime for a Codex session file,
@@ -1834,7 +1851,8 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 }
 
 // ParseCodexSessionIndexTitles reads a Codex session_index.jsonl stream and
-// returns session UUIDs mapped to non-empty thread titles.
+// returns session UUIDs mapped to their thread titles. Explicit blank titles
+// remain present so callers can distinguish them from absent entries.
 func ParseCodexSessionIndexTitles(r io.Reader) (map[string]string, error) {
 	titles := make(map[string]string)
 	s := bufio.NewScanner(r)
@@ -1845,11 +1863,11 @@ func ParseCodexSessionIndexTitles(r io.Reader) (map[string]string, error) {
 			continue
 		}
 		id := gjson.Get(line, "id").Str
-		title := strings.TrimSpace(gjson.Get(line, "thread_name").Str)
-		if id == "" || title == "" {
+		threadName := gjson.Get(line, "thread_name")
+		if id == "" || !threadName.Exists() {
 			continue
 		}
-		titles[id] = title
+		titles[id] = strings.TrimSpace(threadName.Str)
 	}
 	if err := s.Err(); err != nil {
 		return nil, err

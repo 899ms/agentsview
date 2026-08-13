@@ -254,12 +254,16 @@ Grok section and remove the explicit registry exception in the coverage test.
 
 ## Codex (`codex`)
 
-- **Format:** Rollout JSONL files, with a separate JSONL session index used for
-  discovery and metadata. The TUI also maintains an append-oriented
-  `history.jsonl` whose records contain `session_id`, Unix-seconds `ts`, and
-  submitted prompt `text`; configured size enforcement can rewrite a retained
-  tail in place. Agentsview consumes only the first two fields as a
-  live-activity hint.
+- **Format:** Rollout JSONL files, with a separate JSONL session index used by
+  older releases for discovery and metadata. Current releases no longer write
+  `session_index.jsonl`; thread titles live in `thread_history_*.sqlite`
+  databases that agentsview does not read, so an absent index is the normal
+  state, not a rename signal (reverified 2026-08-13 against a live `~/.codex`
+  with no `session_index.jsonl` and a populated `thread_history_1.sqlite`).
+  The TUI also maintains an append-oriented `history.jsonl` whose records
+  contain `session_id`, Unix-seconds `ts`, and submitted prompt `text`;
+  configured size enforcement can rewrite a retained tail in place. Agentsview
+  consumes only the first two fields as a live-activity hint.
 - **Evidence:** `source`.
 - **Upstream:** Clone `https://github.com/openai/codex.git` at
   `406dc9239492aff6d295cca5eebe2a548548d42f`; see the pinned

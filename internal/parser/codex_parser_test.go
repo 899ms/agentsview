@@ -272,6 +272,39 @@ func TestParseCodexSession_EncryptedAgentMessageUsesTaskName(t *testing.T) {
 	assert.Equal(t, "I completed the encrypted task.", msgs[0].Content)
 }
 
+func TestParseCodexSession_ExplicitBlankSubagentTitleSuppressesFallback(
+	t *testing.T,
+) {
+	const encrypted = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "sessions", "2026", "08", "13")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	sessionPath := filepath.Join(
+		sessionDir, "rollout-2026-08-13T12-00-00-child.jsonl",
+	)
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			"child", "parent", "/tmp/project", "user", tsEarly,
+		),
+		testjsonl.CodexAgentMessageJSON(
+			"/root", "/root/worker", "Task received from parent.",
+			encrypted, tsEarlyS1,
+		),
+	)
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, CodexSessionIndexFilename),
+		[]byte(`{"id":"child","thread_name":"   "}`+"\n"), 0o644,
+	))
+
+	sess, _, err := parseCodexTestSession(t, sessionPath, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.True(t, sess.SessionNamePresent)
+	assert.Empty(t, sess.SessionName,
+		"an explicit blank title must suppress the subagent leaf fallback")
+}
+
 func TestParseCodexSession_FernetPrefixPlaintextRemainsVisible(t *testing.T) {
 	const prompt = "gAAAAA is only a prefix here, not an encrypted token."
 	content := testjsonl.JoinJSONL(
@@ -311,6 +344,8 @@ func TestParseCodexSession_UsesThreadNameFromSessionIndex(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 	assert.Equal(t, "Renamed from Codex", sess.SessionName)
+	assert.True(t, sess.SessionNamePresent,
+		"an index entry must remain authoritative at the write boundary")
 	assert.Equal(t, "Add rate limiting", sess.FirstMessage)
 	assert.Len(t, msgs, 2)
 }
@@ -332,7 +367,23 @@ func TestParseCodexSession_LeavesSessionNameEmptyWithoutThreadName(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 	assert.Empty(t, sess.SessionName)
+	assert.False(t, sess.SessionNamePresent,
+		"a missing thread_name field must not become a clearing signal")
 	assert.Equal(t, "Add rate limiting", sess.FirstMessage)
+}
+
+func TestParseCodexSessionIndexTitlesPreservesExplicitBlankTitle(t *testing.T) {
+	titles, err := ParseCodexSessionIndexTitles(strings.NewReader(
+		`{"id":"clear-me","thread_name":"   "}` + "\n" +
+			`{"id":"missing-field"}` + "\n",
+	))
+	require.NoError(t, err)
+
+	title, ok := titles["clear-me"]
+	require.True(t, ok, "an explicit blank title must remain a present entry")
+	assert.Empty(t, title)
+	assert.NotContains(t, titles, "missing-field",
+		"a row without thread_name must not become a clearing signal")
 }
 
 func TestParseCodexSession_UsesThreadNameFromArchivedSessions(t *testing.T) {

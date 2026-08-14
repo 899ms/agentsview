@@ -2393,6 +2393,70 @@ func (db *DB) SetSessionDataVersion(id string, version int) error {
 	return nil
 }
 
+// SetSessionDataVersions atomically stamps the parser data_version on every
+// listed session. This is used when several session rows represent one source:
+// either every member becomes current, or all remain eligible for retry.
+func (db *DB) SetSessionDataVersions(ids []string, version int) error {
+	return db.setSessionDataVersions(ids, version, true)
+}
+
+// SetExistingSessionDataVersions atomically stamps every listed session that
+// already exists, ignoring IDs that have not been inserted yet.
+func (db *DB) SetExistingSessionDataVersions(ids []string, version int) error {
+	return db.setSessionDataVersions(ids, version, false)
+}
+
+func (db *DB) setSessionDataVersions(
+	ids []string, version int, requireAll bool,
+) error {
+	if err := db.requireWritable(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return fmt.Errorf("beginning data version update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		result, err := tx.Exec(
+			`UPDATE sessions SET
+				data_version = ?,
+				local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ?`,
+			version, id,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"setting data_version for %s: %w", id, err,
+			)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf(
+				"checking data_version update for %s: %w", id, err,
+			)
+		}
+		if rows == 0 && !requireAll {
+			continue
+		}
+		if rows != 1 {
+			return fmt.Errorf(
+				"setting data_version for %s: session not found", id,
+			)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing data version update: %w", err)
+	}
+	return nil
+}
+
 // GetSessionMessageCount returns the message_count for a
 // session. Returns (0, false) when the session does not exist.
 func (db *DB) GetSessionMessageCount(
@@ -4663,9 +4727,10 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 	return total, nil
 }
 
-// RestoreSession clears deleted_at, making the session visible again.
-// Returns the number of rows affected (0 if session doesn't exist
-// or is not in trash).
+// RestoreSession clears deleted_at, makes the session visible again, and
+// invalidates source freshness so changes made while it was trashed are parsed.
+// Returns the number of rows affected (0 if session doesn't exist or is not in
+// trash).
 func (db *DB) RestoreSession(id string) (int64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -4678,10 +4743,11 @@ func (db *DB) RestoreSession(id string) (int64, error) {
 		`UPDATE sessions
 		 SET deleted_at = NULL,
 		     deletion_cause = NULL,
+		     data_version = ?,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND deleted_at IS NOT NULL
 		   AND deletion_cause IS NULL`,
-		id,
+		max(CurrentDataVersion()-1, 0), id,
 	)
 	if err != nil {
 		return 0, err
@@ -4693,6 +4759,19 @@ func (db *DB) RestoreSession(id string) (int64, error) {
 	if n > 0 {
 		if _, err := tx.Exec(
 			"DELETE FROM local_session_source_baselines WHERE session_id = ?", id,
+		); err != nil {
+			return 0, err
+		}
+		// The source may have changed while this member was in trash. Force the
+		// next sync to reparse it instead of trusting a digest persisted while
+		// the member was intentionally skipped. Delete by path because a path can
+		// have provider aliases in the freshness table.
+		if _, err := tx.Exec(
+			`DELETE FROM provider_freshness
+			 WHERE file_path = (
+				SELECT file_path FROM sessions WHERE id = ?
+			 )`,
+			id,
 		); err != nil {
 			return 0, err
 		}

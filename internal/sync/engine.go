@@ -942,6 +942,9 @@ func (e *Engine) recordProviderStatHash(
 	if _, ok := e.providerStatHashers[hash.agent]; !ok {
 		return
 	}
+	if !providerStatHashMetadataVerified(hash) {
+		return
+	}
 	if err := e.db.UpsertProviderStatHash(
 		ctx, hash.agent, hash.targetKey, hash.digest,
 	); err != nil {
@@ -950,6 +953,65 @@ func (e *Engine) recordProviderStatHash(
 			hash.agent, hash.targetKey, err,
 		)
 	}
+}
+
+// providerStatHashMetadataVerified prevents Codex freshness from outrunning
+// its title sidecar. A missing session_index.jsonl is normal and verified;
+// read and scan failures are transient and must leave the previous digest in
+// place so a later pass retries the title check.
+func providerStatHashMetadataVerified(hash pendingProviderStatHash) bool {
+	if hash.agent != parser.AgentCodex {
+		return true
+	}
+	if err := parser.VerifyCodexSessionIndex(hash.physicalPath); err != nil {
+		log.Printf(
+			"verify Codex title index before freshness write for %s: %v",
+			hash.physicalPath, err,
+		)
+		return false
+	}
+	return true
+}
+
+// clearProviderSourceFreshness removes a digest that no longer represents a
+// completely committed provider source. Claude DAG members are written stale
+// up front, so correctness does not depend on cleanup succeeding after a
+// partial write.
+func (e *Engine) clearProviderSourceFreshness(
+	ctx context.Context,
+	statHash *pendingProviderStatHash,
+) {
+	if statHash != nil {
+		if err := e.db.DeleteProviderStatHash(
+			ctx, statHash.agent, statHash.targetKey,
+		); err != nil {
+			log.Printf(
+				"delete incomplete provider freshness for %s/%s: %v",
+				statHash.agent, statHash.targetKey, err,
+			)
+		}
+	}
+}
+
+// partitionIntentionalSourceSkips separates active source members from rows
+// that user policy permanently excludes or keeps in trash. Those policy skips
+// already resolve the member for source freshness and must not make active
+// Claude DAG branches stale.
+func (e *Engine) partitionIntentionalSourceSkips(
+	ids []string,
+) (active []string, skipped map[string]bool) {
+	active = make([]string, 0, len(ids))
+	for _, id := range ids {
+		if e.db.IsSessionExcluded(id) || e.db.IsSessionTrashed(id) {
+			if skipped == nil {
+				skipped = make(map[string]bool)
+			}
+			skipped[id] = true
+			continue
+		}
+		active = append(active, id)
+	}
+	return active, skipped
 }
 
 // migrateLegacyCodexExecSkips removes skip cache entries
@@ -7804,15 +7866,72 @@ func (e *Engine) collectAndBatch(
 					failedSessions:  failedSessions,
 					cwdFiltered:     cwdFiltered,
 					written:         make([]bool, len(pending)),
+					resolved:        make([]bool, len(pending)),
 				}
 				if failedSessions == 0 && cwdFiltered == 0 &&
 					writtenSessions == len(pending) {
 					for i := range outcome.written {
 						outcome.written[i] = true
+						outcome.resolved[i] = true
 					}
 				}
 			} else {
 				outcome = e.writeBatchWithOutcome(pending, writeMode, false)
+			}
+			// Claude can emit several session rows from one DAG transcript.
+			// Those rows are initially written below the current data version,
+			// then promoted together only after every active member succeeds.
+			// User-excluded and trashed members are already resolved by policy;
+			// a crash, veto, or failed active member still leaves the source stale.
+			for i, pw := range pending {
+				if pw.sourceWriteCount == 0 {
+					continue
+				}
+				end := i + pw.sourceWriteCount
+				sourceComplete := pw.sourceCompletionEligible &&
+					end <= len(pending) && end <= len(outcome.written)
+				for j := i; j < min(end, len(pending)); j++ {
+					memberResolved := pending[j].sourceCompletionSkipped
+					if j < len(outcome.written) && outcome.written[j] {
+						memberResolved = true
+					}
+					if j < len(outcome.resolved) && outcome.resolved[j] {
+						memberResolved = true
+					}
+					if !memberResolved {
+						sourceComplete = false
+					}
+				}
+				if sourceComplete && pw.promoteSourceOnComplete {
+					ids := make([]string, 0, pw.sourceWriteCount)
+					for j := i; j < end; j++ {
+						if !outcome.written[j] {
+							continue
+						}
+						ids = append(ids, applyIDPrefixToID(
+							e.idPrefix, pending[j].sess.ID,
+						))
+					}
+					if err := e.db.SetSessionDataVersions(
+						ids, db.CurrentDataVersion(),
+					); err != nil {
+						log.Printf(
+							"complete provider source data versions: %v", err,
+						)
+						sourceComplete = false
+						outcome.failedSessions++
+						for j := i; j < end; j++ {
+							outcome.written[j] = false
+						}
+					}
+				}
+				if !sourceComplete {
+					e.clearProviderSourceFreshness(ctx, pw.providerStatHash)
+					continue
+				}
+				if pw.providerStatHash != nil {
+					e.recordProviderStatHash(ctx, *pw.providerStatHash)
+				}
 			}
 			baselineErr := e.baselinePendingWriteSources(
 				ctx, pending, outcome.written,
@@ -7842,30 +7961,6 @@ func (e *Engine) collectAndBatch(
 			stats.cwdFilteredSessions += outcome.cwdFiltered
 			progress.MessagesIndexed += outcome.writtenMessages
 			stats.messagesIndexed = progress.MessagesIndexed
-			// Persist per-component freshness digests for the per-row
-			// entries whose write succeeded. outcome.written[i]
-			// is the authoritative per-source success flag:
-			// writeBatchWithOutcome sets it to false for any row
-			// that was CWD-filtered or whose session upsert failed,
-			// so a single failing row in a mixed batch correctly
-			// suppresses only its own digest persist. Successful
-			// rows in the same batch still get their digests
-			// stamped; a pendingStatHash source whose whole session
-			// row committed is exactly the invariant the side-table
-			// needs to recognize on the next warm pass. A pending
-			// row with no matching written entry fails closed:
-			// without a per-row success flag the write cannot be
-			// confirmed, and an unconfirmed digest persist could
-			// mark an absent session as fresh forever.
-			for i, pw := range pending {
-				if pw.providerStatHash == nil {
-					continue
-				}
-				if i >= len(outcome.written) || !outcome.written[i] {
-					continue
-				}
-				e.recordProviderStatHash(ctx, *pw.providerStatHash)
-			}
 		}()
 		pending = pending[:0]
 		pendingLeases = pendingLeases[:0]
@@ -7975,6 +8070,24 @@ func (e *Engine) collectAndBatch(
 			e.noteSQLiteContainerResult(r.path, false)
 			r.releaseRetention()
 			continue
+		}
+		claudeDAG := r.agent == parser.AgentClaude && len(r.results) > 1
+		var sourceCompletionSkipped map[string]bool
+		if claudeDAG {
+			activeResultIDs, skipped :=
+				e.partitionIntentionalSourceSkips(resultIDs)
+			sourceCompletionSkipped = skipped
+			staleVersion := max(db.CurrentDataVersion()-1, 0)
+			if err := e.db.SetExistingSessionDataVersions(
+				activeResultIDs, staleVersion,
+			); err != nil {
+				e.clearProviderSourceFreshness(ctx, r.providerStatHash)
+				log.Printf("stage Claude source data versions: %v", err)
+				stats.RecordFailed()
+				e.noteSQLiteContainerResult(r.path, false)
+				r.releaseRetention()
+				continue
+			}
 		}
 		excludedSessionIDs, err := e.deleteParserExcludedSessions(
 			r.processResult, sourceAllowsParserExclusions,
@@ -8096,6 +8209,7 @@ func (e *Engine) collectAndBatch(
 			r.path, vetoed == 0 && len(r.retrySessionIDs) == 0,
 		)
 		if vetoed > 0 && len(allowed) == 0 {
+			e.clearProviderSourceFreshness(ctx, r.providerStatHash)
 			stats.cwdFilteredFiles++
 			if r.providerFailureCount == 0 {
 				baselineProcessedSource(r, false)
@@ -8125,27 +8239,36 @@ func (e *Engine) collectAndBatch(
 			stats.messagesIndexed = progress.MessagesIndexed
 			r.releaseRetention()
 		} else {
+			sourceNeedsRetry := vetoed > 0 ||
+				r.providerFailureCount > 0 || len(r.retrySessionIDs) > 0
 			for i, pr := range allowed {
-				needsRetry := r.providerFailureCount > 0 ||
+				sessionNeedsRetry := r.providerWideFailureCount > 0 ||
 					r.needsRetryForSession(pr.Session.ID)
 				pw := pendingWrite{
-					sess:              pr.Session,
-					msgs:              pr.Messages,
-					usageEvents:       pr.UsageEvents,
-					needsRetry:        needsRetry,
-					forceReplace:      r.forceReplace,
-					baselineEligible:  vetoed == 0 && r.providerFailureCount == 0 && !needsRetry,
-					storageTrustPath:  r.storageTrustPath,
-					storageTrustState: r.storageTrustState,
-					storageTrustSnap:  r.storageTrustSnap,
+					sess:                    pr.Session,
+					msgs:                    pr.Messages,
+					usageEvents:             pr.UsageEvents,
+					needsRetry:              sessionNeedsRetry || claudeDAG,
+					forceReplace:            r.forceReplace,
+					baselineEligible:        !sourceNeedsRetry,
+					storageTrustPath:        r.storageTrustPath,
+					storageTrustState:       r.storageTrustState,
+					storageTrustSnap:        r.storageTrustSnap,
+					sourceCompletionSkipped: sourceCompletionSkipped[applyIDPrefixToID(e.idPrefix, pr.Session.ID)],
 				}
-				// The source's per-component digest (providerStatHash) is
-				// a one-row side-table entry keyed by (agent, file_path),
-				// so tagging only the first allowed result is enough.
-				// The flush path below persists it after the matching
-				// session row commits successfully.
-				if i == 0 && r.providerStatHash != nil {
+				if i == 0 &&
+					(r.agent == parser.AgentClaude || r.providerStatHash != nil) {
+					// Claude can emit several DAG branches from one transcript.
+					// Carry their contiguous write count so the flush can make
+					// one source-level completion decision. Other digest-backed
+					// providers currently emit one result per source.
+					pw.sourceWriteCount = 1
+					if r.agent == parser.AgentClaude {
+						pw.sourceWriteCount = len(allowed)
+					}
 					pw.providerStatHash = r.providerStatHash
+					pw.sourceCompletionEligible = !sourceNeedsRetry
+					pw.promoteSourceOnComplete = claudeDAG
 				}
 				pending = append(pending, pw)
 				if runtimeMetrics != nil {
@@ -8156,7 +8279,7 @@ func (e *Engine) collectAndBatch(
 				pendingLeases = append(pendingLeases, r.retentionLease)
 				r.retentionLease = nil
 			}
-			if r.cacheAfterWrite && vetoed == 0 && len(r.retrySessionIDs) == 0 {
+			if r.cacheAfterWrite && !sourceNeedsRetry {
 				pendingCacheWrites = append(pendingCacheWrites, skipCacheWrite{
 					agent:             r.agent,
 					key:               r.skipCacheKey(),
@@ -8335,6 +8458,7 @@ type incrementalUpdate struct {
 	peakContextTokens    int // absolute max(old, new)
 	hasTotalOutputTokens bool
 	hasPeakContextTokens bool
+	providerStatHash     *pendingProviderStatHash
 }
 
 // sessionParseError is a per-session parse failure inside a shared
@@ -8418,6 +8542,10 @@ type processResult struct {
 	// valid partial writes. Reconciliation may persist the valid results, but
 	// must not acknowledge the pass as complete.
 	providerFailureCount int
+	// providerWideFailureCount is the subset of provider failures that applies
+	// to every result in the source. Per-result retry state stays in
+	// retrySessionIDs so one member cannot demote otherwise valid siblings.
+	providerWideFailureCount int
 	// storageTrustPath/State/Snap carry an OpenCode-family storage
 	// session's pre-parse stat signature and invalidation snapshot to
 	// the write path, which promotes it once the session's batch is
@@ -8680,32 +8808,6 @@ func (e *Engine) processProviderFile(
 		source.ProjectHint = file.Project
 	}
 
-	// Capture the per-component stat digest from the same pre-parse
-	// snapshot that gates freshness, BEFORE fingerprinting or parsing
-	// reads the source. Persisting a digest computed after the parse
-	// would race a concurrent companion rewrite: the stored digest would
-	// describe the new file state while the session row holds the old
-	// parse payload, so every later warm sync would short-circuit on the
-	// new digest and the stale row would never be refreshed. This single
-	// snapshot feeds the warm-match comparison in
-	// providerSourceFreshBeforeFingerprint, the confirmed-unchanged-skip
-	// stamp, and the write-path staging, so all three always agree.
-	var preParseStatHash *pendingProviderStatHash
-	if hasher, ok := e.providerStatHashers[file.Agent]; ok {
-		if physicalPath := providerDiscoveredPath(source); physicalPath != "" {
-			targetKey := physicalPath
-			if e.pathRewriter != nil {
-				targetKey = e.pathRewriter(physicalPath)
-			}
-			preParseStatHash = &pendingProviderStatHash{
-				agent:        file.Agent,
-				physicalPath: physicalPath,
-				targetKey:    targetKey,
-				digest:       hasher.ComputeMultiFileStatHash(physicalPath),
-			}
-		}
-	}
-
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
 	if verifiedStateOK && verifiedFresh {
@@ -8723,12 +8825,71 @@ func (e *Engine) processProviderFile(
 		)
 	}
 
+	// Capture the per-component stat digest from the same pre-parse
+	// snapshot that gates freshness, BEFORE fingerprinting or parsing
+	// reads the source. The in-memory verified-source gate runs first so
+	// a warm engine does not pay for a second stat snapshot it will never
+	// consult. Persisting a digest computed after the parse would race a
+	// concurrent companion rewrite: the stored digest would describe the
+	// new file state while the session row holds the old parse payload,
+	// so every later warm sync would short-circuit on the new digest and
+	// the stale row would never be refreshed. This single snapshot feeds
+	// the warm-match comparison in providerSourceFreshBeforeFingerprint,
+	// the confirmed-unchanged-skip stamp, and the write-path staging, so
+	// all three always agree.
+	//
+	// providerStatDigestEligible withholds the capture for
+	// content-authority providers under a pathRewriter: materialized
+	// remote stats cannot prove a re-download unchanged, so their remote
+	// freshness stays content-hash arbitrated.
+	var preParseStatHash *pendingProviderStatHash
+	if hasher, ok := e.providerStatHashers[file.Agent]; ok &&
+		e.providerStatDigestEligible(file.Agent) {
+		if physicalPath := providerDiscoveredPath(source); physicalPath != "" {
+			targetKey := physicalPath
+			if e.pathRewriter != nil {
+				targetKey = e.pathRewriter(physicalPath)
+			}
+			preParseStatHash = &pendingProviderStatHash{
+				agent:        file.Agent,
+				physicalPath: physicalPath,
+				targetKey:    targetKey,
+				digest:       hasher.ComputeMultiFileStatHash(physicalPath),
+			}
+		}
+	}
+
+	// Persisted stat-digest skip. This runs before the single-session
+	// content guard below on purpose: a matching digest (size, mtime,
+	// ctime per component) plus a current stored row proves the source
+	// unchanged without opening it, so a fresh process (daemon restart or
+	// one-shot CLI sync) skips on stats alone instead of re-hashing the
+	// full transcript through providerIncrementalContentChanged. Any real
+	// change -- including a same-size same-mtime in-place rewrite --
+	// bumps a ctime and breaks the digest, falling through to the
+	// content-verified gates.
+	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(
+		ctx, source, file, preParseStatHash,
+	); fresh {
+		if verifiedStateOK {
+			e.promoteVerifiedSource(verifiedCapture)
+		}
+		return processResult{
+			skip:  true,
+			mtime: freshMtime,
+		}, true
+	}
+
 	// DB-freshness skip for single-session JSONL providers (Claude):
 	// when the stored session's size, mtime, and data version already
 	// match the source and its project does not need reparse, skip the
 	// parse entirely. This reproduces the legacy process arm's
 	// shouldSkipFile gate so an unchanged session is not re-parsed on
-	// every full sync.
+	// every full sync. A content-verified skip confirmed the current
+	// bytes against the stored row hash, so it backfills the stat digest
+	// for rows that predate the side-table (or whose digest an index or
+	// companion touch invalidated); without the stamp those rows would
+	// re-hash on every fresh process forever, since a skip never writes.
 	sourceForceReplace := false
 	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 		ctx, provider, source, file,
@@ -8736,6 +8897,11 @@ func (e *Engine) processProviderFile(
 		if !verifiedStateOK || contentVerified {
 			if verifiedStateOK {
 				e.promoteVerifiedSource(verifiedCapture)
+			}
+			if contentVerified {
+				e.stampProviderStatHashForConfirmedSource(
+					ctx, preParseStatHash,
+				)
 			}
 			return processResult{
 				skip:  true,
@@ -8748,14 +8914,6 @@ func (e *Engine) processProviderFile(
 		// ever earning verified-source trust.
 	} else if forceReplace {
 		sourceForceReplace = true
-	}
-	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(
-		ctx, source, file, preParseStatHash,
-	); fresh {
-		return processResult{
-			skip:  true,
-			mtime: freshMtime,
-		}, true
 	}
 
 	// Watermark-only shared-container sources (changed-path classification)
@@ -8806,17 +8964,22 @@ func (e *Engine) processProviderFile(
 			// self-healing (e.g. a parser data-version bump or generated
 			// roborev CI worktree project): clear the entry and fall through
 			// to a full reparse, mirroring the legacy process arm.
-			if !e.providerSkipCacheEntryFreshInDB(
+			cacheFresh, cacheRowHashVerified := e.providerSkipCacheEntryFreshInDB(
 				file,
 				source,
 				fingerprint,
 				providerSemantics,
-			) {
+			)
+			indexChanged, indexVerified := false, true
+			if file.Agent == parser.AgentCodex {
+				indexChanged, indexVerified =
+					e.codexCachedIndexSessionNameState(file.Path)
+			}
+			if !cacheFresh {
 				e.clearSkip(cacheKey)
 			} else if e.pathNeedsCachedSkipBypass(file.Agent, file.Path) {
 				e.clearSkip(cacheKey)
-			} else if file.Agent == parser.AgentCodex &&
-				e.codexCachedIndexSessionNameChanged(file.Path) {
+			} else if indexChanged {
 				// The transcript fingerprint can remain byte-for-byte identical
 				// while session_index.jsonl changes this session's title. Do not
 				// let a pre-existing transcript skip entry hide that metadata
@@ -8857,11 +9020,21 @@ func (e *Engine) processProviderFile(
 					}
 				}
 				if cacheStillFresh {
-					if verifiedStateOK &&
+					if verifiedStateOK && indexVerified &&
 						e.shouldSkipProviderSourceByDB(
 							file, fingerprint, providerSemantics,
 						) {
 						e.promoteVerifiedSource(verifiedCapture)
+					}
+					// The fingerprint just content-hashed the current
+					// source and matched the stored row, so this skip may
+					// backfill or refresh the stat digest for rows that
+					// predate the side-table or whose digest a shared
+					// index touch invalidated.
+					if cacheRowHashVerified && indexVerified {
+						e.stampProviderStatHashForConfirmedSource(
+							ctx, preParseStatHash,
+						)
 					}
 					return processResult{
 						skip:      true,
@@ -8897,6 +9070,10 @@ func (e *Engine) processProviderFile(
 		incRes.mtime = fingerprint.MTimeNS
 		incRes.cacheSkip = cacheSkip
 		incRes.cacheKey = cacheKey
+		if incRes.incremental != nil &&
+			incRes.incremental.fileSize == fingerprint.Size {
+			incRes.incremental.providerStatHash = preParseStatHash
+		}
 		return incRes, true
 	}
 	incForceReplace := sourceForceReplace || incRes.forceReplace
@@ -8909,20 +9086,34 @@ func (e *Engine) processProviderFile(
 	// engine). For Codex this also folds in the session_index.jsonl sidecar:
 	// a shared index mtime bump that did not change this session's title must
 	// not trigger a reparse.
-	if !incForceReplace && !e.forceParse && !file.ForceParse &&
-		e.shouldSkipProviderSourceByDB(
+	if !incForceReplace && !e.forceParse && !file.ForceParse {
+		dbFresh, metadataVerified := e.providerSourceFreshnessByDB(
 			file, fingerprint, providerSemantics,
-		) {
-		if verifiedStateOK {
+		)
+		if dbFresh && verifiedStateOK && metadataVerified {
 			e.promoteVerifiedSource(verifiedCapture)
 		}
-		return processResult{
-			skip:        true,
-			mtime:       fingerprint.MTimeNS,
-			cacheSkip:   cacheSkip,
-			cacheKey:    cacheKey,
-			noCacheSkip: true,
-		}, true
+		// The Codex-family fingerprint content-hashed the rollout and
+		// shouldSkipCodexFingerprint verified it against the stored row
+		// (hash, project, data version, index title), so this skip may
+		// backfill or refresh the stat digest: rows that predate the
+		// side-table, and rollouts whose digest a shared index touch
+		// invalidated without changing their own title, would otherwise
+		// re-hash on every fresh process forever.
+		if dbFresh {
+			if metadataVerified {
+				e.stampProviderStatHashForConfirmedSource(
+					ctx, preParseStatHash,
+				)
+			}
+			return processResult{
+				skip:        true,
+				mtime:       fingerprint.MTimeNS,
+				cacheSkip:   cacheSkip,
+				cacheKey:    cacheKey,
+				noCacheSkip: true,
+			}, true
+		}
 	}
 
 	// DB-stored-file-info skip: a session whose persisted file_size/file_mtime
@@ -8993,10 +9184,11 @@ func (e *Engine) processProviderFile(
 	}
 	applyProviderFingerprintFileInfo(file.Agent, fingerprint, outcome.Results)
 	cleanCache := providerOutcomeAllowsCleanSkipCache(outcome)
-	providerFailureCount := len(outcome.SourceErrors)
+	providerWideFailureCount := len(outcome.SourceErrors)
 	if !outcome.ResultSetComplete {
-		providerFailureCount++
+		providerWideFailureCount++
 	}
+	providerFailureCount := providerWideFailureCount
 	if outcome.SkipReason != parser.SkipNone {
 		if outcome.SkipReason == parser.SkipUnsupportedSource {
 			e.anomalies.recordUnsupportedSourceLayout(string(file.Agent), file.Path)
@@ -9037,16 +9229,17 @@ func (e *Engine) processProviderFile(
 			}
 		}
 		skipRes := processResult{
-			skip:                  !outcome.ForceReplace,
-			excludedSessionIDs:    excludedSessionIDs,
-			sourceMissingMembers:  missingMembers,
-			mtime:                 fingerprint.MTimeNS,
-			cacheSkip:             cacheSkip,
-			cacheKey:              cacheKey,
-			noCacheSkip:           !cleanCache,
-			forceReplace:          outcome.ForceReplace,
-			suppressPresenceSweep: !outcome.ResultSetComplete,
-			providerFailureCount:  providerFailureCount,
+			skip:                     !outcome.ForceReplace,
+			excludedSessionIDs:       excludedSessionIDs,
+			sourceMissingMembers:     missingMembers,
+			mtime:                    fingerprint.MTimeNS,
+			cacheSkip:                cacheSkip,
+			cacheKey:                 cacheKey,
+			noCacheSkip:              !cleanCache,
+			forceReplace:             outcome.ForceReplace,
+			suppressPresenceSweep:    !outcome.ResultSetComplete,
+			providerFailureCount:     providerFailureCount,
+			providerWideFailureCount: providerWideFailureCount,
 		}
 		// A SkipReason outcome without a force-replace carries no parsed data,
 		// so it stays a lease-free skip; a force-replace is parse-bearing.
@@ -9082,18 +9275,19 @@ func (e *Engine) processProviderFile(
 		file, parsedResults, providerSemantics.UnchangedResults,
 	)
 	res := processResult{
-		results:               filteredResults,
-		excludedSessionIDs:    excludedSessionIDs,
-		sourceMissingMembers:  missingMembers,
-		mtime:                 fingerprint.MTimeNS,
-		cacheSkip:             cacheSkip,
-		cacheKey:              cacheKey,
-		noCacheSkip:           !cleanCache,
-		forceReplace:          outcome.ForceReplace || incForceReplace,
-		suppressPresenceSweep: !outcome.ResultSetComplete,
-		providerFailureCount:  providerFailureCount,
-		retentionLease:        lease,
-		providerStatHash:      preParseStatHash,
+		results:                  filteredResults,
+		excludedSessionIDs:       excludedSessionIDs,
+		sourceMissingMembers:     missingMembers,
+		mtime:                    fingerprint.MTimeNS,
+		cacheSkip:                cacheSkip,
+		cacheKey:                 cacheKey,
+		noCacheSkip:              !cleanCache,
+		forceReplace:             outcome.ForceReplace || incForceReplace,
+		suppressPresenceSweep:    !outcome.ResultSetComplete,
+		providerFailureCount:     providerFailureCount,
+		providerWideFailureCount: providerWideFailureCount,
+		retentionLease:           lease,
+		providerStatHash:         preParseStatHash,
 	}
 	if file.Agent == parser.AgentOmnigent && cacheSkip && cleanCache &&
 		!e.forceParse && !file.ForceParse &&
@@ -9512,12 +9706,12 @@ func (e *Engine) applyProviderFilePathPolicies(
 		// veto, a failed upsert, or a parser-skipped session all bypass
 		// the persist call and keep the side-table clean.
 		// Fallback staging for results that bypassed processProviderFile's
-		// pre-parse capture (res.providerStatHash == nil). Today only
-		// Codebuff/Freebuff register a MultiFileStatHasher and their
-		// provider-authoritative path always captures, so this recomputes
-		// post-parse only for hypothetical non-processProviderFile
-		// producers; it is not the hot path.
-		if res.providerStatHash == nil {
+		// pre-parse capture (res.providerStatHash == nil), applying the
+		// same digest-eligibility rule so a path-rewritten import of a
+		// content-authority provider never re-stages what the pre-parse
+		// site deliberately withheld.
+		if res.providerStatHash == nil &&
+			e.providerStatDigestEligible(agent) {
 			if hasher, ok := e.providerStatHashers[agent]; ok {
 				targetKey := filePath
 				if e.pathRewriter != nil {
@@ -9687,19 +9881,26 @@ func providerProcessCacheKeyWithHash(
 	return key + "?source_hash=" + fingerprint.Hash
 }
 
+// providerSkipCacheEntryFreshInDB reports whether a skip-cache hit is
+// still consistent with the archive. rowHashVerified additionally reports
+// that the current fingerprint's content hash was compared against a
+// stored session row and matched -- the only cache outcome strong enough
+// to stamp a provider_freshness digest, since the other fresh returns
+// (hash-free semantics, whole-container identity, no stored row yet)
+// never consult a row.
 func (e *Engine) providerSkipCacheEntryFreshInDB(
 	file parser.DiscoveredFile,
 	source parser.SourceRef,
 	fingerprint parser.SourceFingerprint,
 	providerSemantics parser.ProviderSyncSemantics,
-) bool {
+) (fresh, rowHashVerified bool) {
 	agent := file.Agent
 	if agent == "" {
 		agent = source.Provider
 	}
 	if fingerprint.Hash == "" ||
 		!providerSemantics.FingerprintHashRequiredForFreshness {
-		return true
+		return true, false
 	}
 	if parser.IsOmnigentContainerSource(source) {
 		// A whole-container omnigent source has only virtual member rows in
@@ -9709,7 +9910,7 @@ func (e *Engine) providerSkipCacheEntryFreshInDB(
 		// ProviderSyncSemantics.SkipCacheFreshWithoutStoredRow below, which
 		// trusts an entry only while NO row exists yet and resumes stored-row
 		// hash validation once the provider persists one.
-		return true
+		return true, false
 	}
 	lookupPath := providerSkipLookupPath(file, source, fingerprint)
 	if e.pathRewriter != nil {
@@ -9725,13 +9926,14 @@ func (e *Engine) providerSkipCacheEntryFreshInDB(
 			// mtime/source-signal based until a row exists: a same-mtime rewrite
 			// cannot be distinguished in this no-row state. Hash validation applies
 			// once a session has actually been stored.
-			return true
+			return true, false
 		}
 	}
-	return e.providerFingerprintHashMatchesDB(
+	matched := e.providerFingerprintHashMatchesDB(
 		agent, lookupPath, fingerprint,
 		providerSemantics.FingerprintHashRequiredForFreshness,
 	)
+	return matched, matched
 }
 
 func processFileUsesProvider(agent parser.AgentType) bool {
@@ -10222,12 +10424,14 @@ func (e *Engine) providerSourceUnchangedInDB(
 }
 
 // stampProviderStatHashForConfirmedSource persists the pre-parse
-// per-component stat digest for a source whose provider.Fingerprint was
-// just verified against an existing current session row (the
-// providerSourceUnchangedInDB skip). This is the only pre-write moment a
-// digest may safely be written: a transient failure between an eager stamp
-// and the fingerprint/parse/write that follows would leave a matching
-// digest that permanently suppresses every later retry. The digest is the
+// per-component stat digest for a source whose current content was just
+// verified against an existing current session row: the Claude
+// content-verified single-session skip, the hash-validated cache skip,
+// the Codex-family DB-fingerprint skip, and providerSourceUnchangedInDB.
+// These are the only pre-write moments a digest may safely be written: a
+// transient failure between an eager stamp and the fingerprint/parse/write
+// that follows would leave a matching digest that permanently suppresses
+// every later retry. The digest is the
 // pre-parse snapshot captured in processProviderFile, so it describes
 // exactly the file state the fingerprint verified, and the DB key uses the
 // pathRewriter's logical key, mirroring the write path. Providers without
@@ -10238,6 +10442,9 @@ func (e *Engine) stampProviderStatHashForConfirmedSource(
 	statHash *pendingProviderStatHash,
 ) {
 	if statHash == nil || statHash.digest == 0 {
+		return
+	}
+	if !providerStatHashMetadataVerified(*statHash) {
 		return
 	}
 	if err := e.db.UpsertProviderStatHash(
@@ -10346,13 +10553,13 @@ func (f fakeSnapshotInfo) Sys() any    { return nil }
 
 // providerSingleSessionFresh reports whether a single-session JSONL
 // provider's source (Claude) maps to a stored session that is already
-// up to date: the source size and mtime match what is stored, the row
-// is at the current parser data version, and its project does not need
-// reparse. It reproduces the legacy Claude process arm's shouldSkipFile
-// gate so an unchanged session is skipped instead of re-parsed every
-// full sync. Providers without incremental append, multi-session
-// sources, or sources that are not a single physical file are never
-// considered fresh here and always fall through to the full parse.
+// up to date: the source size and mtime match what is stored, every active row
+// for the source is at the current parser data version, and the main row's
+// project does not need reparse. It reproduces the legacy Claude process arm's
+// shouldSkipFile gate so an unchanged session is skipped instead of re-parsed
+// every full sync. Providers without incremental append, multi-session sources,
+// or sources that are not a single physical file are never considered fresh
+// here and always fall through to the full parse.
 func (e *Engine) providerSingleSessionFresh(
 	ctx context.Context,
 	provider parser.Provider,
@@ -10413,6 +10620,16 @@ func (e *Engine) providerSingleSessionFresh(
 		}
 	}
 	if !e.shouldSkipFile(sessionID, info) {
+		return 0, false, false, false
+	}
+	// Claude transcripts can fan out into several active DAG sessions. The
+	// filename stem identifies only the main row, so its current version cannot
+	// hide a stale restored fork that shares the same source path.
+	_, sourceDataVersion, _, _, sourceFound :=
+		e.db.GetSourceRepairStateByAgentPath(
+			lookupPath, string(parser.AgentClaude),
+		)
+	if !sourceFound || sourceDataVersion < db.CurrentDataVersion() {
 		return 0, false, false, false
 	}
 	if e.providerIncrementalIdentityChanged(lookupPath, info) {
@@ -10485,34 +10702,97 @@ func (e *Engine) providerIncrementalContentChanged(
 // rule the provider's cold-write fingerprint uses. Codebuff/Freebuff
 // delegate to parser.CodebuffCompanionMtime, which is the single
 // source of truth for the max(chat, run-state, chat-meta) derivation;
-// other MultiFileStatHasher agents fall through to chat-only since
-// they have no sibling companions to fold in.
+// Codex folds session_index.jsonl exactly as its fingerprint stamps
+// file_mtime (parser.CodexEffectiveMtime), so a cold→warm cycle does
+// not drift; other MultiFileStatHasher agents fall through to
+// chat-only since they have no sibling companions to fold in.
 func providerStatFreshnessMtime(
 	agent parser.AgentType,
 	lookupPath string,
 	chatInfo os.FileInfo,
 ) int64 {
-	if agent != parser.AgentCodebuff && agent != parser.AgentFreebuff {
+	switch agent {
+	case parser.AgentCodebuff, parser.AgentFreebuff:
+		return parser.CodebuffCompanionMtime(lookupPath, chatInfo)
+	case parser.AgentCodex:
+		return parser.CodexEffectiveMtime(
+			lookupPath, chatInfo.ModTime().UnixNano(),
+		)
+	default:
 		return chatInfo.ModTime().UnixNano()
 	}
-	return parser.CodebuffCompanionMtime(lookupPath, chatInfo)
 }
 
-// providerFreshDigestSourceCurrentInDB reports whether the stored session
-// row for a digest-matched source is still current: the row exists, its
-// data version is current, and it does not need a project reparse. A
+// providerStatDigestEligible reports whether this engine may stage,
+// stamp, or consult a provider_freshness stat digest for the agent. The
+// content-hashing single-file JSONL providers (Claude, Codex family) are
+// ineligible under a pathRewriter: a remote import materializes a fresh
+// physical file whose mtime is copied from the remote and whose ctime is
+// the import clock, so a same-stat different-content re-download can
+// collide with a stored digest inside one coarse filesystem timestamp
+// tick and skip a real rewrite. Their remote freshness stays
+// content-hash arbitrated, matching the pathRewriter carve-outs in
+// providerIncrementalIdentityChanged. Codebuff stays eligible
+// everywhere: its remote flow deliberately stamps the per-component
+// composite under the logical key (see
+// TestSyncCodebuffProviderStatHashRemoteStoresUnderLogicalKey).
+func (e *Engine) providerStatDigestEligible(agent parser.AgentType) bool {
+	if e.pathRewriter == nil {
+		return true
+	}
+	return agent != parser.AgentClaude && !isCodexFormatAgent(agent)
+}
+
+// providerFreshnessAgents returns the stored-agent labels a provider's
+// sessions may carry for digest-currency checks. Codebuff relabels
+// free-tier sessions to Freebuff while discovery and the
+// provider_freshness side-table stay keyed on Codebuff, so both labels
+// are this provider's own rows; every other hasher stores under its
+// discovery label.
+func providerFreshnessAgents(agent parser.AgentType) []parser.AgentType {
+	if agent == parser.AgentCodebuff {
+		return []parser.AgentType{parser.AgentCodebuff, parser.AgentFreebuff}
+	}
+	return []parser.AgentType{agent}
+}
+
+// providerFreshDigestSourceCurrentInDB reports whether the active stored
+// sessions for a digest-matched source are still current. User-trashed rows
+// are resolved until restoration invalidates the digest and marks the row
+// stale, so they do not participate in the repair check. A
 // matching provider_freshness digest proves only that the file stat is
 // unchanged; these checks are what allow the digest short-circuit to skip
-// safely, mirroring the tail guards of providerSourceUnchangedInDB.
-func (e *Engine) providerFreshDigestSourceCurrentInDB(lookupPath string) bool {
-	if _, _, ok := e.db.GetFileInfoByPath(lookupPath); !ok {
-		return false
+// safely, mirroring the tail guards of providerSourceUnchangedInDB. Every
+// lookup is scoped to the provider's own stored-agent labels: Codex and
+// TraeX can index the same rollout path, and a path-only lookup would let
+// this agent's skip borrow the other agent's newer row and hide a repair
+// (e.g. a stale generated project) on its own row.
+func (e *Engine) providerFreshDigestSourceCurrentInDB(
+	agent parser.AgentType, lookupPath string,
+) bool {
+	rowFound := false
+	for _, owned := range providerFreshnessAgents(agent) {
+		if _, _, ok := e.db.GetFileInfoByAgentPath(
+			lookupPath, string(owned),
+		); !ok {
+			continue
+		}
+		rowFound = true
+		project, dataVersion, _, _, active :=
+			e.db.GetSourceRepairStateByAgentPath(
+				lookupPath, string(owned),
+			)
+		if !active {
+			continue
+		}
+		if parser.NeedsProjectReparse(project) {
+			return false
+		}
+		if dataVersion < db.CurrentDataVersion() {
+			return false
+		}
 	}
-	if project, ok := e.db.GetProjectByPath(lookupPath); ok &&
-		parser.NeedsProjectReparse(project) {
-		return false
-	}
-	return e.db.GetDataVersionByPath(lookupPath) >= db.CurrentDataVersion()
+	return rowFound
 }
 
 func (e *Engine) providerSourceFreshBeforeFingerprint(
@@ -10557,14 +10837,23 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 	// cancel out in sum-of-sizes). The side-table is populated
 	// only after an outcome the engine can trust: a successful
 	// write's flushPending, a single-session writeSessionFull
-	// commit, or the DB-confirmed unchanged skip in processFile
-	// (stampProviderStatHashForConfirmedSource, which runs only
-	// after the current fingerprint was verified against an
-	// existing current session row). Nothing here ever persists
+	// commit, or a confirmed-unchanged skip in processProviderFile
+	// (stampProviderStatHashForConfirmedSource at the Claude
+	// content-verified skip, the hash-validated cache skip, the
+	// Codex-family DB-fingerprint skip, and
+	// providerSourceUnchangedInDB — each runs only after the
+	// current source content was verified against an existing
+	// current session row). Nothing here ever persists
 	// the digest before fingerprinting, parsing, or session
 	// writing succeeds — a transient failure must not leave a
 	// matching digest that suppresses every later retry.
 	if preParseStatHash != nil {
+		// Zero is the hasher's unverified sentinel. Do not consult the
+		// side-table: even a corrupt or legacy zero row must not turn an
+		// unavailable change-time into trusted freshness.
+		if preParseStatHash.digest == 0 {
+			return 0, false
+		}
 		stored, hasStored, hashErr :=
 			e.db.GetProviderStatHash(ctx, file.Agent, lookupPath)
 		switch {
@@ -10594,10 +10883,13 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 			// old cold-stamp): a transient failure after the stamp
 			// would leave a matching digest that suppresses every
 			// later retry. Instead the loop is closed at the
-			// DB-confirmed unchanged skip in processFile, which runs
-			// after provider.Fingerprint verified the current source
-			// against an existing current session row — the only
-			// pre-write moment the digest may safely be persisted.
+			// confirmed-unchanged skips in processProviderFile
+			// (Claude content-verified, hash-validated cache,
+			// Codex-family DB-fingerprint, providerSourceUnchangedInDB),
+			// each of which runs only after the current source content
+			// was verified against an existing current session row —
+			// the only pre-write moments the digest may safely be
+			// persisted.
 			// A genuinely new or changed source flows through a
 			// successful write whose flushPending (or writeSessionFull)
 			// persists the digest; CWD-filtered sources stay absent
@@ -10624,7 +10916,9 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 			// because this short-circuit never reaches fingerprinting or
 			// parsing. Defer to the fingerprint path whenever the stored
 			// row is missing, stale, or needs project reclassification.
-			if !e.providerFreshDigestSourceCurrentInDB(lookupPath) {
+			if !e.providerFreshDigestSourceCurrentInDB(
+				file.Agent, lookupPath,
+			) {
 				return 0, false
 			}
 			return providerStatFreshnessMtime(file.Agent, lookupPath, info), true
@@ -11231,10 +11525,23 @@ func (e *Engine) shouldSkipProviderSourceByDB(
 	fingerprint parser.SourceFingerprint,
 	semantics parser.ProviderSyncSemantics,
 ) bool {
+	fresh, _ := e.providerSourceFreshnessByDB(file, fingerprint, semantics)
+	return fresh
+}
+
+// providerSourceFreshnessByDB returns the Codex-family DB freshness decision
+// and whether all metadata needed to persist local stat trust was verified.
+// A transient Codex title-index failure may still skip unchanged transcript
+// content, but it cannot promote in-memory trust or stamp a stat digest.
+func (e *Engine) providerSourceFreshnessByDB(
+	file parser.DiscoveredFile,
+	fingerprint parser.SourceFingerprint,
+	semantics parser.ProviderSyncSemantics,
+) (fresh, metadataVerified bool) {
 	if !isCodexFormatAgent(file.Agent) {
-		return false
+		return false, false
 	}
-	return e.shouldSkipCodexFingerprint(
+	return e.codexFingerprintFreshness(
 		file.Agent, file.Path, fingerprint, semantics,
 	)
 }
@@ -11256,6 +11563,18 @@ func (e *Engine) shouldSkipCodexFingerprint(
 	fingerprint parser.SourceFingerprint,
 	semantics parser.ProviderSyncSemantics,
 ) bool {
+	fresh, _ := e.codexFingerprintFreshness(
+		agent, path, fingerprint, semantics,
+	)
+	return fresh
+}
+
+func (e *Engine) codexFingerprintFreshness(
+	agent parser.AgentType,
+	path string,
+	fingerprint parser.SourceFingerprint,
+	semantics parser.ProviderSyncSemantics,
+) (fresh, metadataVerified bool) {
 	lookupPath := path
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(path)
@@ -11264,47 +11583,53 @@ func (e *Engine) shouldSkipCodexFingerprint(
 		lookupPath, string(agent),
 	)
 	if !ok || storedSize != fingerprint.Size {
-		return false
+		return false, false
 	}
 	if !e.providerFingerprintHashMatchesDB(
 		agent, lookupPath,
 		fingerprint,
 		semantics.FingerprintHashRequiredForFreshness,
 	) {
-		return false
+		return false, false
 	}
 	if project, ok := e.db.GetProjectByAgentPath(
 		lookupPath, string(agent),
 	); ok &&
 		parser.NeedsProjectReparse(project) {
-		return false
+		return false, false
 	}
 	if e.db.GetDataVersionByAgentPath(lookupPath, string(agent)) <
 		db.CurrentDataVersion() {
-		return false
+		return false, false
 	}
 	effectiveMtime := fingerprint.MTimeNS
-	if storedMtime == effectiveMtime {
-		return true
-	}
 	if agent != parser.AgentCodex {
-		return false
+		return storedMtime == effectiveMtime, true
 	}
+	statFresh := storedMtime == effectiveMtime
 	if effectiveMtime < storedMtime {
 		indexPath := parser.CodexSessionIndexPath(path)
 		if indexPath != "" {
 			if _, err := os.Stat(indexPath); errors.Is(err, os.ErrNotExist) {
-				return true
+				statFresh = true
 			}
 		}
 	}
-	fileMtime := effectiveMtime
-	if info, err := os.Stat(path); err == nil {
-		fileMtime = info.ModTime().UnixNano()
+	if effectiveMtime > storedMtime {
+		fileMtime := effectiveMtime
+		if info, err := os.Stat(path); err == nil {
+			fileMtime = info.ModTime().UnixNano()
+		}
+		statFresh = fileMtime <= storedMtime
 	}
-	return effectiveMtime > storedMtime &&
-		fileMtime <= storedMtime &&
-		!e.codexIndexSessionNameChanged(path)
+	if !statFresh {
+		return false, false
+	}
+	changed, verified := e.codexIndexSessionNameState(path)
+	if !verified {
+		return true, false
+	}
+	return !changed, true
 }
 
 // codexIndexNeedsRefreshSince reports whether a Codex session whose transcript
@@ -11332,40 +11657,53 @@ func (e *Engine) codexIndexNeedsRefreshSince(
 }
 
 func (e *Engine) codexIndexSessionNameChanged(path string) bool {
+	changed, _ := e.codexIndexSessionNameState(path)
+	return changed
+}
+
+func (e *Engine) codexIndexSessionNameState(
+	path string,
+) (changed, verified bool) {
 	uuid := parser.CodexSessionUUIDFromFilename(filepath.Base(path))
 	if uuid == "" {
-		return false
+		return false, false
 	}
-	currentName, ok := parser.LookupCodexThreadNameEntry(path, uuid)
+	currentName, ok, err := parser.ReadCodexThreadNameEntry(path, uuid)
+	if err != nil {
+		return false, false
+	}
 	if !ok {
 		// No index entry means no rename signal, not a rename to empty.
 		// Modern Codex releases stopped writing session_index.jsonl; a
 		// stored title compared against the absent index would force a
 		// full re-parse of every titled session on every sync, and the
 		// rewrite preserves the title, so the loop could never converge.
-		return false
+		return false, true
 	}
 	storedName, found, err := e.db.GetSessionName(
 		context.Background(), e.idPrefix+"codex:"+uuid,
 	)
 	if err != nil || !found {
-		return true
+		return true, true
 	}
-	return codexSessionNameDiffers(storedName, currentName)
+	return codexSessionNameDiffers(storedName, currentName), true
 }
 
-// codexCachedIndexSessionNameChanged limits title-based cache invalidation to
-// sources that already have stored session state. A cached parse failure has no
-// title to refresh and must retain its retry-suppression semantics.
-func (e *Engine) codexCachedIndexSessionNameChanged(path string) bool {
+// codexCachedIndexSessionNameState limits title-based cache invalidation to
+// sources that already have stored session state. A cached parse failure has
+// no title to refresh and its missing row counts as verified for cache-only
+// retry suppression; no digest can be stamped without a stored row hash.
+func (e *Engine) codexCachedIndexSessionNameState(
+	path string,
+) (changed, verified bool) {
 	lookupPath := path
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(path)
 	}
 	if _, _, ok := e.db.GetFileInfoByPath(lookupPath); !ok {
-		return false
+		return false, true
 	}
-	return e.codexIndexSessionNameChanged(path)
+	return e.codexIndexSessionNameState(path)
 }
 
 // classifyCodexIndexPath maps a Codex session_index.jsonl change to the
@@ -11946,12 +12284,17 @@ type pendingWrite struct {
 	// outcome is safe to make deletion-eligible after this write succeeds.
 	baselineEligible bool
 	// providerStatHash is set on the first allowed ParseResult of a
-	// source whose processResult staged a per-component freshness
-	// digest. The flush path persists it after the matching session
-	// row commits successfully, so a downstream write failure or a
-	// CWD-filter veto never marks an absent or stale session as
-	// fresh. nil when the source is not a multi-file hasher agent.
-	providerStatHash *pendingProviderStatHash
+	// source whose processResult staged a per-component freshness digest.
+	// sourceWriteCount tells the flush how many contiguous results must commit
+	// before it may persist the digest. Claude uses the full DAG result count;
+	// other digest-backed providers currently use one.
+	providerStatHash         *pendingProviderStatHash
+	sourceWriteCount         int
+	sourceCompletionEligible bool
+	promoteSourceOnComplete  bool
+	// sourceCompletionSkipped marks a user-excluded or trashed member that
+	// resolves source completeness without requiring a write or promotion.
+	sourceCompletionSkipped bool
 	// storageTrustPath/State/Snap promote the session's OpenCode
 	// storage-gate trust after its batch is confirmed fully written.
 	// Empty for everything else.
@@ -12099,6 +12442,9 @@ type writeBatchOutcome struct {
 	failedSessions  int
 	cwdFiltered     int
 	written         []bool
+	// resolved includes actual writes plus user-excluded or trashed sessions.
+	// It stays separate from written so stats and baselines count real writes.
+	resolved []bool
 }
 
 type skipCacheWrite struct {
@@ -12394,7 +12740,10 @@ func (e *Engine) writeBatchWithOutcome(
 	)
 	if err != nil {
 		log.Printf("normalize pending write machines: %v", err)
-		outcome := writeBatchOutcome{written: make([]bool, len(batch))}
+		outcome := writeBatchOutcome{
+			written:  make([]bool, len(batch)),
+			resolved: make([]bool, len(batch)),
+		}
 		for _, pw := range batch {
 			e.markStaleFailedMemberWrite(pw)
 		}
@@ -12406,7 +12755,10 @@ func (e *Engine) writeBatchWithOutcome(
 	)
 	if err != nil {
 		log.Printf("preserve unavailable source projects: %v", err)
-		outcome := writeBatchOutcome{written: make([]bool, len(batch))}
+		outcome := writeBatchOutcome{
+			written:  make([]bool, len(batch)),
+			resolved: make([]bool, len(batch)),
+		}
 		for _, pw := range batch {
 			e.markStaleFailedMemberWrite(pw)
 		}
@@ -12417,7 +12769,10 @@ func (e *Engine) writeBatchWithOutcome(
 		return e.writeBatchBulkWithOutcome(batch, forceReplace)
 	}
 
-	outcome := writeBatchOutcome{written: make([]bool, len(batch))}
+	outcome := writeBatchOutcome{
+		written:  make([]bool, len(batch)),
+		resolved: make([]bool, len(batch)),
+	}
 	resolveWorktreeProject := e.loadWorktreeProjectResolver()
 	for i, pw := range batch {
 		s, msgs, verdict := e.prepareSessionWrite(
@@ -12450,6 +12805,7 @@ func (e *Engine) writeBatchWithOutcome(
 			e.upsertSessionPendingContentForWrite(pw, s)
 		if err != nil {
 			if isIntentionalSessionSkip(err) {
+				outcome.resolved[i] = true
 				if pw.sess.File.Path != "" {
 					e.cacheSkip(
 						pw.sess.File.Path,
@@ -12533,6 +12889,7 @@ func (e *Engine) writeBatchWithOutcome(
 		outcome.writtenSessions++
 		outcome.writtenMessages += len(msgs)
 		outcome.written[i] = true
+		outcome.resolved[i] = true
 	}
 	return outcome
 }
@@ -13369,11 +13726,15 @@ type localGitIdentity struct {
 func (e *Engine) writeBatchBulkWithOutcome(
 	batch []pendingWrite, forceReplace bool,
 ) writeBatchOutcome {
-	outcome := writeBatchOutcome{written: make([]bool, len(batch))}
+	outcome := writeBatchOutcome{
+		written:  make([]bool, len(batch)),
+		resolved: make([]bool, len(batch)),
+	}
 	writes := make([]db.SessionBatchWrite, 0, len(batch))
 	pendingIndexes := make([]int, 0, len(batch))
 	sources := make(map[string]batchSourceFile, len(batch))
 	pendingByID := make(map[string]pendingWrite, len(batch))
+	pendingIndexByID := make(map[string]int, len(batch))
 	resolveWorktreeProject := e.loadWorktreeProjectResolver()
 
 	for pendingIndex, pw := range batch {
@@ -13410,6 +13771,7 @@ func (e *Engine) writeBatchBulkWithOutcome(
 		})
 		pendingIndexes = append(pendingIndexes, pendingIndex)
 		pendingByID[s.ID] = pw
+		pendingIndexByID[s.ID] = pendingIndex
 		if pw.sess.File.Path != "" {
 			sources[s.ID] = batchSourceFile{
 				path:        pw.sess.File.Path,
@@ -13438,7 +13800,9 @@ func (e *Engine) writeBatchBulkWithOutcome(
 	}
 	for _, writtenIndex := range result.WrittenIndexes {
 		if writtenIndex >= 0 && writtenIndex < len(pendingIndexes) {
-			outcome.written[pendingIndexes[writtenIndex]] = true
+			pendingIndex := pendingIndexes[writtenIndex]
+			outcome.written[pendingIndex] = true
+			outcome.resolved[pendingIndex] = true
 		}
 	}
 	for _, id := range result.FailedIDs {
@@ -13447,6 +13811,9 @@ func (e *Engine) writeBatchBulkWithOutcome(
 		}
 	}
 	for _, id := range result.ExcludedIDs {
+		if pendingIndex, ok := pendingIndexByID[id]; ok {
+			outcome.resolved[pendingIndex] = true
+		}
 		if source, ok := sources[id]; ok && source.path != "" {
 			e.cacheSkip(
 				source.path, source.mtime, source.fingerprint,
@@ -14121,6 +14488,11 @@ func (e *Engine) writeIncremental(
 	// errors are logged inside recomputeSignalsFromDB and are
 	// non-fatal; a later write or flush retries.
 	e.signalSched.markDirty(inc.sessionID)
+	if inc.providerStatHash != nil {
+		e.recordProviderStatHash(
+			context.Background(), *inc.providerStatHash,
+		)
+	}
 
 	return nil
 }
@@ -15596,6 +15968,22 @@ func (e *Engine) processAndWriteSessionFile(
 	if err := e.db.QueueSubagentParentCleanupRepairs(priorChildren); err != nil {
 		return false, fmt.Errorf("queue subagent parent repairs: %w", err)
 	}
+	claudeDAG := file.Agent == parser.AgentClaude && len(res.results) > 1
+	var sourceCompletionSkipped map[string]bool
+	if claudeDAG {
+		activeResultIDs, skipped :=
+			e.partitionIntentionalSourceSkips(resultIDs)
+		sourceCompletionSkipped = skipped
+		staleVersion := max(db.CurrentDataVersion()-1, 0)
+		if err := e.db.SetExistingSessionDataVersions(
+			activeResultIDs, staleVersion,
+		); err != nil {
+			e.clearProviderSourceFreshness(ctx, res.providerStatHash)
+			return false, fmt.Errorf(
+				"stage Claude source data versions: %w", err,
+			)
+		}
+	}
 	// Always attempt queued work after mutations begin, including when a later
 	// write or scoped link fails. Post-write capture below expands this flag
 	// when the write introduces children that did not exist before it.
@@ -15692,13 +16080,23 @@ func (e *Engine) processAndWriteSessionFile(
 		return false, nil
 	}
 
-	written := 0
+	sourceNeedsRetry := res.providerFailureCount > 0 ||
+		len(res.retrySessionIDs) > 0
+	resolved := 0
+	writtenIDs := make([]string, 0, len(res.results))
+	markSourceIncomplete := func() {
+		if file.Agent == parser.AgentClaude {
+			e.clearProviderSourceFreshness(ctx, res.providerStatHash)
+		}
+	}
 	for i, pr := range res.results {
+		sessionNeedsRetry := res.providerWideFailureCount > 0 ||
+			res.needsRetryForSession(pr.Session.ID)
 		write := pendingWrite{
 			sess:         pr.Session,
 			msgs:         pr.Messages,
 			usageEvents:  pr.UsageEvents,
-			needsRetry:   res.needsRetryForSession(pr.Session.ID),
+			needsRetry:   sessionNeedsRetry || claudeDAG,
 			forceReplace: res.forceReplace,
 		}
 		// The session upsert commits parser-derived parent provenance before
@@ -15708,25 +16106,28 @@ func (e *Engine) processAndWriteSessionFile(
 		if err := e.db.QueueSubagentParentRepairs(
 			[]string{resultIDs[i]},
 		); err != nil {
+			markSourceIncomplete()
 			return false, fmt.Errorf(
 				"queue attempted session parent repair: %w", err,
 			)
 		}
 		repairQueued = true
 		writeErr := e.writeSessionFull(write)
+		memberPolicySkipped := sourceCompletionSkipped[resultIDs[i]]
 		// Full-write stages commit independently. Message content (and a new
 		// spawn edge) can persist even when a later usage, data-version, or
 		// sibling write fails, so discover and queue children after every
 		// attempt rather than waiting for the entire result set to finish.
 		queueErr := queueWrittenChildren([]string{resultIDs[i]})
 		if writeErr == nil {
-			// A nil writeSessionFull is the single-session analog of
-			// outcome.written[i]=true in flushPending; only counted
-			// successes advance the persisted-digest gate below.
-			written++
+			resolved++
+			writtenIDs = append(writtenIDs, resultIDs[i])
+		} else if isIntentionalSessionSkip(writeErr) || memberPolicySkipped {
+			resolved++
 		}
 		if writeErr != nil &&
 			!isIntentionalSessionSkip(writeErr) &&
+			!memberPolicySkipped &&
 			!errors.Is(writeErr, errSessionPreserved) {
 			// Mirror the batch write paths: a partial write (session
 			// row updated, messages or usage not) must demote the
@@ -15736,30 +16137,43 @@ func (e *Engine) processAndWriteSessionFile(
 			if queueErr != nil {
 				writeErr = errors.Join(writeErr, queueErr)
 			}
+			markSourceIncomplete()
 			return false, fmt.Errorf("write session %s: %w",
 				pr.Session.ID, writeErr)
 		}
 		if queueErr != nil {
+			markSourceIncomplete()
 			return false, queueErr
 		}
-		if errors.Is(writeErr, errSessionPreserved) {
+		if !memberPolicySkipped && errors.Is(writeErr, errSessionPreserved) {
 			preserved = true
 		}
 	}
-	// Persist staged digest only when at least one session row
-	// actually committed. Mirrors the per-row gate in flushPending:
-	// a session-trashed, parser-excluded, or otherwise skipped
-	// batch must NOT stamp provider_freshness with a digest whose
-	// matching session row was not actually persisted. Without this
-	// the single-session sync path would leave provider_freshness
-	// empty for Codebuff/Freebuff forever, leaving the digest gate
-	// un-armed on the next warm pass and a stale session row
-	// unrepaired by the per-component digest.
-	if written > 0 && res.providerStatHash != nil {
-		e.recordProviderStatHash(ctx, *res.providerStatHash)
+	// A source-level digest is valid only when every active result and its
+	// hierarchy links commit without retry state or archive preservation.
+	// User-excluded and trashed members are resolved without writes; the other
+	// Claude DAG members stay stale until the source-level decision succeeds.
+	sourceComplete := resolved == len(res.results) &&
+		!preserved && !sourceNeedsRetry
+	if !sourceComplete {
+		markSourceIncomplete()
 	}
 	if err := e.db.LinkSubagentSessionsForSessions(resultIDs); err != nil {
+		markSourceIncomplete()
 		return false, fmt.Errorf("link changed subagent sessions: %w", err)
+	}
+	if sourceComplete && claudeDAG {
+		if err := e.db.SetSessionDataVersions(
+			writtenIDs, db.CurrentDataVersion(),
+		); err != nil {
+			markSourceIncomplete()
+			return false, fmt.Errorf(
+				"complete Claude source data versions: %w", err,
+			)
+		}
+	}
+	if sourceComplete && res.providerStatHash != nil {
+		e.recordProviderStatHash(ctx, *res.providerStatHash)
 	}
 
 	return preserved, nil

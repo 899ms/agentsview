@@ -3981,8 +3981,10 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	_, err = te.db.PinMessage("upload-pinned", msgs[0].ID, &note)
 	require.NoError(t, err, "PinMessage")
 
+	// The pinned message is unchanged; only the reply was edited, so
+	// the pin re-attaches to its message through the identity rules.
 	updated := testjsonl.NewSessionBuilder().
-		AddClaudeUser(tsEarly, "updated upload").
+		AddClaudeUser(tsEarly, "original upload").
 		AddClaudeAssistant(tsEarlyS5, "updated reply").
 		String()
 	w = te.upload(t, "upload-pinned.jsonl", updated,
@@ -4000,6 +4002,133 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	if pins[0].Note == nil || *pins[0].Note != note {
 		t.Fatalf("pin note = %v, want %q", pins[0].Note, note)
 	}
+}
+
+// TestUploadSession_ReuploadDropsPinOnEditedMessage documents the
+// intended limit: a re-upload that edits the pinned UUID-less message
+// itself destroys the only identity the pin can follow, so the pin is
+// dropped rather than guessed onto the edited row. Both stores apply
+// the same rule, keeping SQLite and PostgreSQL consistent.
+func TestUploadSession_ReuploadDropsPinOnEditedMessage(t *testing.T) {
+	te := setup(t)
+
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "original upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w := te.upload(t, "upload-pin-edited.jsonl", initial,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	msgs, err := te.db.GetAllMessages(
+		context.Background(), "upload-pin-edited",
+	)
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "initial messages")
+	_, err = te.db.PinMessage("upload-pin-edited", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "edited upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w = te.upload(t, "upload-pin-edited.jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(
+		context.Background(), "upload-pin-edited", "",
+	)
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"editing the pinned message drops the pin")
+}
+
+func TestUploadSession_ReuploadDoesNotMoveLegacyPinToIDEEnvelope(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{{
+		SessionID: sessionID, Ordinal: 0, Role: "user",
+		Content: mixedPrompt, ContentLength: len(mixedPrompt),
+	}}), "seed legacy mixed prompt")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 1, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"legacy pin must not move from the prompt to hidden IDE metadata")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 2, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+}
+
+func TestUploadSession_ReuploadFollowsLegacyPinAcrossIDEEnvelopeSplit(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-after-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{
+		{
+			SessionID: sessionID, Ordinal: 0, Role: "user",
+			Content: mixedPrompt, ContentLength: len(mixedPrompt),
+		},
+		{
+			SessionID: sessionID, Ordinal: 1, Role: "assistant",
+			Content: "Legacy reply", ContentLength: len("Legacy reply"),
+		},
+	}), "seed legacy messages")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 2, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		AddClaudeAssistant(tsEarlyS5, "Legacy reply").
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	// The envelope split shifts the whole visible tail. The pin's
+	// role, content, and occurrence rank identify its message, so the
+	// pin follows "Legacy reply" to its shifted ordinal instead of
+	// re-attaching to the visible prompt at the saved ordinal.
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "legacy pin must survive the envelope split")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin follows its message, not the saved ordinal")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 3, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+	assert.Equal(t, "Legacy reply", msgs[2].Content)
 }
 
 func TestUploadSession_EmptyFile(t *testing.T) {

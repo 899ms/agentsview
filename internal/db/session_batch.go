@@ -437,7 +437,9 @@ func writeOneSessionBatchTx(
 		}
 	}
 	if replaceMessages {
-		if err := restorePinsTx(tx, write.Session.ID, pins); err != nil {
+		if err := restorePinsTx(
+			tx, write.Session.ID, pins,
+		); err != nil {
 			return 0, err
 		}
 		// A full message replacement re-normalizes every row, so this row is

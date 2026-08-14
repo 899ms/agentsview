@@ -1188,24 +1188,191 @@ func (d *DB) CopySessionMetadataFrom(
 	}
 
 	// Copy pinned messages (table may not exist in older DBs).
-	// Map old message_id to new message_id via the
-	// (session_id, ordinal) natural key, since auto-increment
-	// IDs differ between DBs.
+	// Auto-increment message IDs differ between DBs, so old
+	// message_id must be re-resolved against the fresh rows.
+	// Prefer the source_uuid natural key: a re-parse can insert or
+	// drop rows (e.g. the v88 IDE-envelope split), shifting ordinals
+	// so that the old (session_id, ordinal) key lands on an unrelated
+	// row. The uuid must be unique on BOTH sides: a duplicate in the
+	// old DB means the uuid does not identify which message the pin
+	// was on, so transferring it to a lone same-uuid survivor could
+	// misattach a pin whose real target was removed by the re-parse.
+	// Duplicated uuids fall back to the pin's occurrence rank inside
+	// its (uuid, role, content) group, requiring the group to keep its
+	// size on both sides: rank follows the pinned occurrence across
+	// ordinal shifts, while a changed group size means the rank no
+	// longer identifies an occurrence. Legacy pins whose source row
+	// has no source_uuid fall back the same way over the visible
+	// (role, content) group. A nonempty uuid with no safe
+	// match means the pinned message is gone: the pin is dropped rather
+	// than silently attached to whatever now occupies its ordinal.
 	if oldDBHasTable(ctx, tx, "pinned_messages") {
+		hasSourceUUID := oldDBHasColumn(
+			ctx, tx, "messages", "source_uuid",
+		)
+		if hasSourceUUID {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO main.pinned_messages
+					(session_id, message_id, ordinal, note, created_at)
+				SELECT
+					op.session_id, new_m.id, new_m.ordinal,
+					op.note, op.created_at
+				FROM old_db.pinned_messages op
+				JOIN old_db.messages old_m
+					ON old_m.id = op.message_id
+				JOIN main.messages new_m
+					ON new_m.session_id = old_m.session_id
+					AND new_m.source_uuid = old_m.source_uuid
+				WHERE op.session_id IN (
+					SELECT id FROM main.sessions
+				)
+				AND old_m.source_uuid != ''
+				AND (
+					SELECT COUNT(*) FROM main.messages x
+					WHERE x.session_id = old_m.session_id
+					AND x.source_uuid = old_m.source_uuid
+				) = 1
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y
+					WHERE y.session_id = old_m.session_id
+					AND y.source_uuid = old_m.source_uuid
+				) = 1`); err != nil {
+				return fmt.Errorf(
+					"copying pinned messages by source uuid: %w", err,
+				)
+			}
+		}
+		// Rank fallback for duplicated uuids: identical (uuid, role,
+		// content) rows are distinguishable only by position, so a pin
+		// transfers to the row holding the same occurrence rank inside
+		// its identity group, provided the group kept its size on both
+		// sides. Rank, unlike the old ordinal, follows the pinned
+		// occurrence across shifts caused by rows inserted before the
+		// group; a changed group size means the rank no longer
+		// identifies an occurrence and the pin is dropped. When the
+		// uuid was unique the source_uuid pass already restored the
+		// same row and INSERT OR IGNORE dedupes.
+		if hasSourceUUID {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO main.pinned_messages
+					(session_id, message_id, ordinal, note, created_at)
+				SELECT
+					op.session_id, new_m.id, new_m.ordinal,
+					op.note, op.created_at
+				FROM old_db.pinned_messages op
+				JOIN old_db.messages old_m
+					ON old_m.id = op.message_id
+				JOIN main.messages new_m
+					ON new_m.session_id = old_m.session_id
+					AND new_m.source_uuid = old_m.source_uuid
+					AND new_m.role = old_m.role
+					AND new_m.content = old_m.content
+				WHERE op.session_id IN (
+					SELECT id FROM main.sessions
+				)
+				AND old_m.source_uuid != ''
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y
+					WHERE y.session_id = old_m.session_id
+					AND y.source_uuid = old_m.source_uuid
+					AND y.role = old_m.role
+					AND y.content = old_m.content
+				) = (
+					SELECT COUNT(*) FROM main.messages x
+					WHERE x.session_id = old_m.session_id
+					AND x.source_uuid = old_m.source_uuid
+					AND x.role = old_m.role
+					AND x.content = old_m.content
+				)
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y2
+					WHERE y2.session_id = old_m.session_id
+					AND y2.source_uuid = old_m.source_uuid
+					AND y2.role = old_m.role
+					AND y2.content = old_m.content
+					AND y2.ordinal <= old_m.ordinal
+				) = (
+					SELECT COUNT(*) FROM main.messages x2
+					WHERE x2.session_id = old_m.session_id
+					AND x2.source_uuid = old_m.source_uuid
+					AND x2.role = old_m.role
+					AND x2.content = old_m.content
+					AND x2.ordinal <= new_m.ordinal
+				)`); err != nil {
+				return fmt.Errorf(
+					"copying duplicated-uuid pinned messages: %w", err,
+				)
+			}
+		}
+		// Rank fallback for legacy pins without a uuid, mirroring
+		// restoreLegacyPinByRankTx: the pin transfers to the visible
+		// row holding its role, content, and occurrence rank within
+		// the visible (role, content) group, provided the group kept
+		// its size on both sides. Rank follows the pinned occurrence
+		// across shifts from rows the re-parse inserted (e.g. hidden
+		// IDE-envelope rows); a changed group size means the rank no
+		// longer identifies an occurrence and the pin is dropped. A
+		// legacy row may gain a provider uuid in the fresh DB while
+		// retaining this fallback identity. Old archives may predate
+		// the is_system column; without it every old row counts as
+		// visible.
+		legacyOnly := ""
+		if hasSourceUUID {
+			legacyOnly = `
+			AND (old_m.source_uuid IS NULL
+				OR old_m.source_uuid = '')`
+		}
+		oldMVisible, oldYVisible, oldY2Visible := "", "", ""
+		if oldDBHasColumn(ctx, tx, "messages", "is_system") {
+			oldMVisible = `
+			AND old_m.is_system = 0`
+			oldYVisible = `
+				AND y.is_system = 0`
+			oldY2Visible = `
+				AND y2.is_system = 0`
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO main.pinned_messages
 				(session_id, message_id, ordinal, note, created_at)
 			SELECT
-				op.session_id, new_m.id, op.ordinal,
+				op.session_id, new_m.id, new_m.ordinal,
 				op.note, op.created_at
 			FROM old_db.pinned_messages op
 			JOIN old_db.messages old_m
 				ON old_m.id = op.message_id
 			JOIN main.messages new_m
 				ON new_m.session_id = old_m.session_id
-				AND new_m.ordinal = old_m.ordinal
+				AND new_m.role = old_m.role
+				AND new_m.content = old_m.content
+				AND new_m.is_system = 0
 			WHERE op.session_id IN (
 				SELECT id FROM main.sessions
+			)`+legacyOnly+oldMVisible+`
+			AND (
+				SELECT COUNT(*) FROM old_db.messages y
+				WHERE y.session_id = old_m.session_id
+				AND y.role = old_m.role
+				AND y.content = old_m.content`+oldYVisible+`
+			) = (
+				SELECT COUNT(*) FROM main.messages x
+				WHERE x.session_id = old_m.session_id
+				AND x.role = old_m.role
+				AND x.content = old_m.content
+				AND x.is_system = 0
+			)
+			AND (
+				SELECT COUNT(*) FROM old_db.messages y2
+				WHERE y2.session_id = old_m.session_id
+				AND y2.role = old_m.role
+				AND y2.content = old_m.content
+				AND y2.ordinal <= old_m.ordinal`+oldY2Visible+`
+			) = (
+				SELECT COUNT(*) FROM main.messages x2
+				WHERE x2.session_id = old_m.session_id
+				AND x2.role = old_m.role
+				AND x2.content = old_m.content
+				AND x2.is_system = 0
+				AND x2.ordinal <= new_m.ordinal
 			)`); err != nil {
 			return fmt.Errorf("copying pinned messages: %w", err)
 		}
@@ -2206,35 +2373,11 @@ func copyPinnedMessagesForIDs(
 		return nil
 	}
 
-	// Re-map old message IDs to the newly inserted message rows.
-	// Prefer source_uuid when available because it survives ordinal
-	// shifts, then fall back to the same (session_id, ordinal)
-	// natural key used by tool call copying.
-	if oldDBHasColumn(ctx, tx, "messages", "source_uuid") {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO main.pinned_messages
-				(session_id, message_id, ordinal, note, created_at)
-			SELECT
-				op.session_id, new_m.id, new_m.ordinal,
-				op.note, op.created_at
-			FROM old_db.pinned_messages op
-			JOIN old_db.messages old_m
-				ON old_m.id = op.message_id
-			JOIN main.messages new_m
-				ON new_m.session_id = old_m.session_id
-				AND new_m.source_uuid = old_m.source_uuid
-			WHERE op.session_id IN (
-				SELECT id FROM `+tempIDsTable+`
-			)
-			  AND old_m.source_uuid IS NOT NULL
-			  AND old_m.source_uuid <> ''`,
-		); err != nil {
-			return fmt.Errorf(
-				"copying pinned messages by source_uuid: %w", err,
-			)
-		}
-	}
-
+	// Re-map old message IDs to the newly inserted message rows. These
+	// orphaned messages were copied verbatim above, so their ordinals
+	// cannot shift. source_uuid is not a safe key here because providers
+	// can duplicate it across messages; joining on it would turn one pin
+	// into one pin for every matching row.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO main.pinned_messages
 			(session_id, message_id, ordinal, note, created_at)
@@ -2251,7 +2394,7 @@ func copyPinnedMessagesForIDs(
 			SELECT id FROM `+tempIDsTable+`
 		)`,
 	); err != nil {
-		return fmt.Errorf("copying pinned messages by ordinal: %w", err)
+		return fmt.Errorf("copying pinned messages: %w", err)
 	}
 	return nil
 }

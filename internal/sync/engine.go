@@ -2551,6 +2551,9 @@ func (e *Engine) resyncBuildLocked(
 	}
 
 	for contributorIndex, contributor := range opts.Contributors {
+		if contributor.Started != nil {
+			contributor.Started()
+		}
 		contributorEngine := NewEngine(newDB, contributor.Config)
 		contributorEngine.archiveStore = origDB
 		contributorProgress := func(p Progress) {
@@ -2573,6 +2576,9 @@ func (e *Engine) resyncBuildLocked(
 			contributorOldFileSessions[contributorIndex],
 			0,
 		)
+		if contributorSafetyAbort {
+			contributorStats.Aborted = true
+		}
 		mergeSyncStats(&stats, contributorStats)
 		if opts.includePhaseDiagnostics {
 			stats.RebuildPhases = append(stats.RebuildPhases, phase)
@@ -2580,6 +2586,9 @@ func (e *Engine) resyncBuildLocked(
 		if contributorStats.Aborted || stats.Aborted || ctx.Err() != nil ||
 			contributorSafetyAbort {
 			contributorEngine.Close()
+			if contributor.Finished != nil {
+				contributor.Finished(contributorStats, ctx.Err())
+			}
 			newDB.Close()
 			removeTempDB(tempPath)
 			restoreSkipCache()
@@ -2599,6 +2608,9 @@ func (e *Engine) resyncBuildLocked(
 		if contributor.AfterSync != nil {
 			if err := contributor.AfterSync(contributorEngine, newDB); err != nil {
 				contributorEngine.Close()
+				if contributor.Finished != nil {
+					contributor.Finished(contributorStats, err)
+				}
 				newDB.Close()
 				removeTempDB(tempPath)
 				restoreSkipCache()
@@ -2617,6 +2629,9 @@ func (e *Engine) resyncBuildLocked(
 			}
 		}
 		contributorEngine.Close()
+		if contributor.Finished != nil {
+			contributor.Finished(contributorStats, nil)
+		}
 	}
 
 	localSafetyAbort := false
@@ -3333,12 +3348,14 @@ func (e *rebuildCleanupError) RetryCleanup() error {
 // SyncThenRunWithRebuild coordinates local sync, optional contributor
 // preparation, an atomic multi-source rebuild, and post-rebuild work under the
 // engine's exclusive sync lock. Preparation only runs when a rebuild is
-// required, and work never runs after a failed or aborted rebuild.
+// required. rebuildDone runs after a rebuild attempt completes and before
+// post-rebuild work begins. Work never runs after a failed or aborted rebuild.
 func (e *Engine) SyncThenRunWithRebuild(
 	ctx context.Context,
 	full bool,
 	onProgress ProgressFunc,
 	prepare func() (RebuildOptions, RebuildCleanup, error),
+	rebuildDone func(SyncStats, error),
 	work func(forceFull, rebuilt bool) error,
 ) (stats SyncStats, retErr error) {
 	if e.refuseWriteInForceParse("SyncThenRunWithRebuild") {
@@ -3376,12 +3393,18 @@ func (e *Engine) SyncThenRunWithRebuild(
 			}()
 		}
 		if err != nil {
+			if rebuildDone != nil {
+				rebuildDone(SyncStats{}, err)
+			}
 			return SyncStats{}, err
 		}
 		opts.includePhaseDiagnostics = true
 		stats, err = e.resyncAllWithOptionsLocked(
 			ctx, onProgress, opts, productionRebuildOperations,
 		)
+		if rebuildDone != nil {
+			rebuildDone(stats, err)
+		}
 		if err != nil {
 			return stats, err
 		}

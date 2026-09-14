@@ -1840,7 +1840,7 @@ schemas keep their existing ordering behavior.
 - **Evidence:** `source`.
 
 - **Upstream:** Clone `https://github.com/deepseek-ai/deepseek-harness.git` at
-  `56c4c3e47c195ff5edbfe3d307bdef81f3de348b` (reverified 2026-09-11). The
+  `56c4c3e47c195ff5edbfe3d307bdef81f3de348b` (reverified 2026-09-14). The
   [frozen version-0 codec](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/session/session-format-v0-to-v1/src/codec.ts),
 
     [released event inventory](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/session/session-format-v0-to-v1/src/dispositions.ts),

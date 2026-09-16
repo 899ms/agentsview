@@ -1323,7 +1323,15 @@ func (s *Server) humaResumeSession(
 		}
 		model = primaryResumeModel(counts)
 	}
-	cmd := resumeCommand(string(session.Agent), tmpl, rawID, model)
+	resumeTarget := rawID
+	if session.Agent == string(parser.AgentPi) && session.FilePath != nil &&
+		*session.FilePath != "" {
+		resumeTarget = *session.FilePath
+		if host != "" {
+			resumeTarget = strings.TrimPrefix(resumeTarget, host+":")
+		}
+	}
+	cmd := resumeCommand(string(session.Agent), tmpl, resumeTarget, model)
 	if string(session.Agent) == "claude" {
 		if req.SkipPermissions {
 			cmd += " --dangerously-skip-permissions"
@@ -1343,7 +1351,7 @@ func (s *Server) humaResumeSession(
 	}
 	responseCmd := cmd
 	switch string(session.Agent) {
-	case "claude", "kiro":
+	case "claude", "kiro", "pi":
 		if host != "" {
 			responseCmd = commandWithDir(cmd, launchDir)
 		} else {

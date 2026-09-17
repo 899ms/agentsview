@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -24,7 +25,8 @@ import (
 )
 
 func (s *Server) registerSessionRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Sessions")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Sessions")
 
 	s.get(group, "/sessions", "List sessions", s.humaListSessions)
 	s.get(group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
@@ -35,11 +37,18 @@ func (s *Server) registerSessionRoutes() {
 	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
 	s.get(group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
 	s.get(group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
+	// Huma does not infer nullability for pointers to object schemas.
+	registry := s.api.OpenAPI().Components.Schemas
+	timing := registry.Schema(reflect.TypeFor[db.SessionTiming](), false, "")
+	timing.Properties["slowest_call"] = &huma.Schema{
+		AnyOf: []*huma.Schema{registry.Schema(reflect.TypeFor[db.CallTiming](), true, ""), {Type: "null"}},
+	}
+
 	s.get(group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
 	s.stream(group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
 	s.stream(group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
-	s.raw(group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", s.humaExportSession)
-	s.raw(group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", s.humaMarkdownSession)
+	s.raw(group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", "text/html", s.humaExportSession)
+	s.raw(group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", "text/markdown", s.humaMarkdownSession)
 	s.post(group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
 	s.post(group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
 	s.get(group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)

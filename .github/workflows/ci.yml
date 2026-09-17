@@ -37,6 +37,9 @@ jobs:
       - name: Run Go linters
         run: make lint-ci
 
+      - name: Check Huma API contract
+        run: go run go.kenn.io/kit/cmd/huma-check@efb469cee12d24fd52640ea05b03ced275bf4370 -fix=false ./...
+
   frontend:
     runs-on: ubuntu-latest
     steps:

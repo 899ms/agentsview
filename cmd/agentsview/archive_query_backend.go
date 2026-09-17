@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"go.kenn.io/agentsview/internal/apiclient"
 	"os"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -84,7 +86,7 @@ func resolveArchiveQueryBackendWithConfig(
 				if policy.AutoStart && !policy.SkipInitialSync && !policy.NoSync && !tr.ReadOnly {
 					progress := newResyncProgressPrinter(os.Stderr, time.Now)
 					_, err := postDaemonPush[sync.SyncStats](ctx, tr, cfg.AuthToken,
-						"/api/v1/sync?wait=true&startup_only=true", daemonPushRequest{}, progress.Print)
+						daemonStartupSync, apiclient.DaemonPushRequest{}, progress.Print)
 					progress.Finish()
 					if err != nil {
 						return nil, nil, fmt.Errorf("waiting for startup sync: %w", err)
@@ -221,7 +223,7 @@ func (b daemonArchiveQueryBackend) MachineLabels(
 ) (service.MachineLabelCatalog, error) {
 	return service.MachineLabels(
 		ctx,
-		service.NewHTTPBackend(b.tr.URL, b.authToken, b.tr.ReadOnly, ""),
+		servicehttp.NewHTTPBackend(b.tr.URL, b.authToken, b.tr.ReadOnly, ""),
 	)
 }
 

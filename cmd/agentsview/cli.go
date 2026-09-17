@@ -158,6 +158,7 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 	var replace bool
 	var pprofEnabled bool
 	var skipInitialSync bool
+	var restartPort int
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the web UI and sync server",
@@ -191,7 +192,7 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 				NoSyncExplicit:  cmd.Flags().Changed("no-sync"),
 				SkipInitialSync: skipInitialSync,
 				Pprof:           pprofEnabled,
-			})
+			}, restartPort)
 			return nil
 		},
 	}
@@ -228,11 +229,27 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 		"Serve net/http/pprof under /debug/pprof (developer use)",
 	)
 	_ = cmd.Flags().MarkHidden("pprof")
+	cmd.Flags().IntVar(
+		&restartPort,
+		"restart-port",
+		0,
+		"Reuse a previous daemon port while retaining automatic fallback",
+	)
+	_ = cmd.Flags().MarkHidden("restart-port")
 	config.RegisterServePFlags(cmd.Flags())
 	cmd.AddCommand(newServeStatusCommand())
 	cmd.AddCommand(newServeStopCommand())
 	cmd.AddCommand(newServeRestartCommand(deps))
 	return cmd
+}
+
+func applyServeRestartPort(cfg config.Config, port int) (config.Config, int) {
+	requestedPort := cfg.Port
+	if port > 0 {
+		cfg.Port = port
+		cfg.PortExplicit = false
+	}
+	return cfg, requestedPort
 }
 
 func runServeDataVersionCheck(cfg config.Config) error {

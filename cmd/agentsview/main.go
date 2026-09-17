@@ -132,7 +132,7 @@ func applyServeMemoryLimit() {
 	debug.SetMemoryLimit(serveMemoryLimitBytes)
 }
 
-func runServe(cfg config.Config, opts serveOptions) {
+func runServe(cfg config.Config, opts serveOptions, restartPort int) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 	applyServeMemoryLimit()
@@ -488,12 +488,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 		scheduler.Wait()
 	}()
 
-	rtOpts := serveRuntimeOptions{
-		Mode:           "serve",
-		RequestedPort:  cfg.Port,
-		OnCaddyStarted: startupProgress.SetCaddyProcess,
-	}
-	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
+	preparedCfg, rtOpts, prepErr := prepareRunServeRuntimeConfig(
+		cfg, restartPort, startupProgress.SetCaddyProcess,
+	)
 	if prepErr != nil {
 		fatal("%v", prepErr)
 	}
@@ -559,9 +556,13 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// write fails, keep the start lock as a fallback "server
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
+	var explicitPort *int
+	if rt.Cfg.PortExplicit {
+		explicitPort = new(rtOpts.RequestedPort)
+	}
 	if _, sfErr := writeDaemonRuntimeWithAuthAndNoSync(
 		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, rt.PublicURL, false,
-		rt.Cfg.RequireAuth, rt.Cfg.NoSync,
+		rt.Cfg.RequireAuth, rt.Cfg.NoSync, explicitPort,
 		rt.Caddy.Pid(),
 	); sfErr != nil {
 		reportRuntimeRecordWrite(

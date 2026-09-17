@@ -36,6 +36,21 @@ func TestServeBackgroundChildArgsRemovesBackgroundFlag(t *testing.T) {
 			want: []string{"serve", "--port", "0"},
 		},
 		{
+			name: "explicit port equals form",
+			args: []string{"serve", "--background", "--replace", "--port=9000"},
+			want: []string{"serve", "--port=9000"},
+		},
+		{
+			name: "explicit port separate value",
+			args: []string{"serve", "--background", "--port", "9000"},
+			want: []string{"serve", "--port", "9000"},
+		},
+		{
+			name: "omitted port stays omitted",
+			args: []string{"serve", "--background", "--replace"},
+			want: []string{"serve"},
+		},
+		{
 			name: "equals form",
 			args: []string{"serve", "--background=true", "--host", "0.0.0.0"},
 			want: []string{"serve", "--host", "0.0.0.0"},
@@ -1884,7 +1899,7 @@ func TestEnsureBackgroundServePreservesNoSyncWhenReplacingOlderDaemon(
 	dir := runtimeTestDir(t)
 	host, port := testPingServer(t)
 	_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, host, port, "1.0.0", "", false, false, true,
+		dir, host, port, "1.0.0", "", false, false, true, nil,
 	)
 	require.NoError(t, err)
 
@@ -1946,7 +1961,7 @@ func TestRunServeBackgroundPreservesNoSyncWhenReplacingOlderDaemon(
 			writeRuntime: func(t *testing.T, dir, host string, port int) {
 				t.Helper()
 				_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-					dir, host, port, "1.0.0", "", false, false, true,
+					dir, host, port, "1.0.0", "", false, false, true, nil,
 				)
 				require.NoError(t, err)
 			},
@@ -2034,7 +2049,7 @@ func TestRunServeBackgroundConfigOnlyDoesNotAdoptReplacedDaemonNoSync(
 			writeRuntime: func(t *testing.T, dir, host string, port int) {
 				t.Helper()
 				_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-					dir, host, port, "1.0.0", "", false, false, true,
+					dir, host, port, "1.0.0", "", false, false, true, nil,
 				)
 				require.NoError(t, err)
 			},
@@ -2462,7 +2477,7 @@ func TestRunServeBackgroundKeepsInvocationNoSyncWhenReplacingSyncingDaemon(
 	dir := runtimeTestDir(t)
 	oldHost, oldPort := testPingServer(t)
 	_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, oldHost, oldPort, "1.0.0", "", false, false, false,
+		dir, oldHost, oldPort, "1.0.0", "", false, false, false, nil,
 	)
 	require.NoError(t, err)
 	setTestVersion(t, "1.1.0")

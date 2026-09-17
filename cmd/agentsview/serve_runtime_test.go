@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/server"
@@ -20,6 +22,157 @@ func testBackendReadyConfig(ts *httptest.Server, token string) config.Config {
 		Port:      ts.Listener.Addr().(*net.TCPAddr).Port,
 		AuthToken: token,
 	}
+}
+
+func heldLoopbackPort(t *testing.T) (net.Listener, int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := listener.Addr().(*net.TCPAddr).Port
+	return listener, port
+}
+
+func TestPrepareServeRuntimeConfigExplicitPortCollision(t *testing.T) {
+	listener, port := heldLoopbackPort(t)
+	defer listener.Close()
+	_ = testDataDir(t)
+	cmd := newServeCommand()
+	require.NoError(t, cmd.Flags().Parse([]string{
+		"--host", "127.0.0.1", "--port", strconv.Itoa(port),
+	}))
+	publicURL := fmt.Sprintf("https://viewer.example.test:%d/archive/", port)
+	cfg := mustLoadConfig(cmd)
+	cfg.PublicURL = publicURL
+	cfg.PublicOrigins = []string{publicURL}
+
+	var got config.Config
+	var err error
+	output := captureStdout(t, func() {
+		got, err = prepareServeRuntimeConfig(cfg, serveRuntimeOptions{
+			RequestedPort: port,
+		})
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("requested port %d", port))
+	assert.Contains(t, err.Error(), "127.0.0.1")
+	assert.Equal(t, cfg, got)
+	assert.NotContains(t, output, "in use, using")
+	assert.Equal(t, publicURL, got.PublicURL)
+	assert.Equal(t, []string{publicURL}, got.PublicOrigins)
+}
+
+func TestPrepareServeRuntimeConfigPortPolicy(t *testing.T) {
+	tests := []struct {
+		name  string
+		fn    func(*testing.T) (config.Config, serveRuntimeOptions, func())
+		check func(*testing.T, config.Config, config.Config, string)
+	}{
+		{
+			name: "implicit collision keeps fallback and rewrites public URL",
+			fn: func(t *testing.T) (config.Config, serveRuntimeOptions, func()) {
+				listener, port := heldLoopbackPort(t)
+				publicURL := fmt.Sprintf(
+					"https://viewer.example.test:%d", port,
+				)
+				return config.Config{
+					Host:          "127.0.0.1",
+					Port:          port,
+					PublicURL:     publicURL,
+					PublicOrigins: []string{publicURL},
+				}, serveRuntimeOptions{RequestedPort: port}, func() {
+					_ = listener.Close()
+				}
+			},
+			check: func(t *testing.T, before, after config.Config, output string) {
+				assert.NotEqual(t, before.Port, after.Port)
+				assert.Equal(t, fmt.Sprintf(
+					"https://viewer.example.test:%d", after.Port,
+				), after.PublicURL)
+				assert.Equal(t, []string{after.PublicURL}, after.PublicOrigins)
+				assert.Contains(t, output, "in use, using")
+			},
+		},
+		{
+			name: "explicit zero selects an ephemeral port",
+			fn: func(t *testing.T) (config.Config, serveRuntimeOptions, func()) {
+				return config.Config{
+					Host:         "127.0.0.1",
+					Port:         0,
+					PortExplicit: true,
+				}, serveRuntimeOptions{}, func() {}
+			},
+			check: func(t *testing.T, _, after config.Config, output string) {
+				assert.Positive(t, after.Port)
+				assert.True(t, after.PortExplicit)
+				assert.Contains(t, output, "Using available port")
+			},
+		},
+		{
+			name: "free explicit port stays unchanged",
+			fn: func(t *testing.T) (config.Config, serveRuntimeOptions, func()) {
+				listener, port := heldLoopbackPort(t)
+				listener.Close()
+				return config.Config{
+					Host:         "127.0.0.1",
+					Port:         port,
+					PortExplicit: true,
+				}, serveRuntimeOptions{RequestedPort: port}, func() {}
+			},
+			check: func(t *testing.T, before, after config.Config, output string) {
+				assert.Equal(t, before.Port, after.Port)
+				assert.True(t, after.PortExplicit)
+				assert.Empty(t, output)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before, opts, cleanup := tt.fn(t)
+			defer cleanup()
+			var (
+				after config.Config
+				err   error
+			)
+			output := captureStdout(t, func() {
+				after, err = prepareServeRuntimeConfig(before, opts)
+			})
+			require.NoError(t, err)
+			tt.check(t, before, after, output)
+		})
+	}
+}
+
+func TestPrepareRunServeRuntimeConfigRestartPreservesConfiguredURLRewrite(t *testing.T) {
+	listener, runtimePort := heldLoopbackPort(t)
+	defer listener.Close()
+	configuredPort := runtimePort - 1
+	publicURL := fmt.Sprintf("https://viewer.example.test:%d", configuredPort)
+
+	got, rtOpts, err := prepareRunServeRuntimeConfig(config.Config{
+		Host:          "127.0.0.1",
+		Port:          configuredPort,
+		PublicURL:     publicURL,
+		PublicOrigins: []string{publicURL},
+	}, runtimePort, nil)
+	require.NoError(t, err)
+	assert.NotEqual(t, runtimePort, got.Port)
+	assert.False(t, got.PortExplicit)
+	assert.Equal(t, configuredPort, rtOpts.RequestedPort)
+	assert.Equal(t, fmt.Sprintf(
+		"https://viewer.example.test:%d", got.Port,
+	), got.PublicURL)
+	assert.Equal(t, []string{got.PublicURL}, got.PublicOrigins)
+
+	srv := server.New(got, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	runtime, err := startServerWithOptionalCaddy(ctx, got, srv, rtOpts)
+	require.NoError(t, err)
+	assert.Equal(t, got.PublicURL, runtime.PublicURL)
+	require.NoError(t, srv.Shutdown(context.Background()))
+	require.ErrorIs(t, <-runtime.ServeErrCh, http.ErrServerClosed)
 }
 
 func TestWaitForBackendReadyRejectsUnrelatedHTTPListener(t *testing.T) {

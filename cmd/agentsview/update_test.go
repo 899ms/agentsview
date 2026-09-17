@@ -2,6 +2,10 @@ package main
 
 import (
 	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -151,9 +155,80 @@ func TestRestartDaemonAfterUpdateArgsPreserveRuntimeBind(t *testing.T) {
 	})
 
 	assert.Equal(t, []string{
-		"serve", "--background", "--host", "0.0.0.0", "--port", "18080",
+		"serve", "--background", "--host", "0.0.0.0", "--restart-port", "18080",
 		"--require-auth", "--no-sync",
 	}, args)
+}
+
+func TestUpdateRestartPreservesPortChoice(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		ephemeral bool
+		occupied  bool
+	}{
+		{name: "explicit port preserves forwarded URL"},
+		{name: "explicit port rejects collision", occupied: true},
+		{name: "explicit zero keeps automatic selection", ephemeral: true, occupied: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := testDataDir(t)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "config.toml"), []byte(
+				"port = 8080\npublic_url = \"http://viewer.example.test:8080\"\n"+
+					"public_origins = [\"http://viewer.example.test:8080\"]\n",
+			), 0o600))
+			listener, port := heldLoopbackPort(t)
+			require.NoError(t, listener.Close())
+			if tt.ephemeral {
+				port = 0
+			}
+			cmd := newServeCommand()
+			require.NoError(t, cmd.Flags().Parse([]string{"--port", strconv.Itoa(port)}))
+			cfg, err := config.LoadPFlags(cmd.Flags())
+			require.NoError(t, err)
+			first, _, err := prepareRunServeRuntimeConfig(cfg, 0, nil)
+			require.NoError(t, err)
+			require.Equal(t, "http://viewer.example.test:8080", first.PublicURL)
+			_, err = WriteDaemonRuntimeWithAuthAndNoSync(
+				dir, first.Host, first.Port, "test", first.PublicURL, false, false, false, new(port),
+			)
+			require.NoError(t, err)
+			oldStop := stopDaemonRuntimeForUpgrade
+			stopDaemonRuntimeForUpgrade = func(_ config.Config, rt *DaemonRuntime) error {
+				require.Equal(t, first.Port, rt.Port)
+				return nil
+			}
+			t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
+			stopped, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+			require.NoError(t, err)
+			require.True(t, stopped.Stopped)
+			if tt.occupied {
+				listener, err := net.Listen("tcp", net.JoinHostPort(first.Host, strconv.Itoa(first.Port)))
+				require.NoError(t, err)
+				t.Cleanup(func() { listener.Close() })
+			}
+			args := serveBackgroundChildArgs(restartDaemonAfterUpdateArgs(config.Config{}, stopped))
+			cmd = newServeCommand()
+			require.NoError(t, cmd.Flags().Parse(args[1:]))
+			cfg, err = config.LoadPFlags(cmd.Flags())
+			require.NoError(t, err)
+			restartPort, err := cmd.Flags().GetInt("restart-port")
+			require.NoError(t, err)
+			restarted, _, err := prepareRunServeRuntimeConfig(cfg, restartPort, nil)
+			if tt.occupied && !tt.ephemeral {
+				require.ErrorContains(t, err, "requested port")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "http://viewer.example.test:8080", restarted.PublicURL)
+			assert.Equal(t, []string{"http://viewer.example.test:8080"}, restarted.PublicOrigins)
+			if tt.ephemeral {
+				assert.Positive(t, restarted.Port)
+				assert.NotEqual(t, first.Port, restarted.Port)
+			} else {
+				assert.Equal(t, first.Port, restarted.Port)
+			}
+		})
+	}
 }
 
 func TestRestartDaemonAfterUpdateArgsDropsLegacyNonLoopbackWithoutAuthConfig(t *testing.T) {
@@ -163,7 +238,7 @@ func TestRestartDaemonAfterUpdateArgsDropsLegacyNonLoopbackWithoutAuthConfig(t *
 	})
 
 	assert.Equal(t, []string{
-		"serve", "--background", "--host", "127.0.0.1", "--port", "18080",
+		"serve", "--background", "--host", "127.0.0.1", "--restart-port", "18080",
 	}, args)
 }
 
@@ -176,7 +251,7 @@ func TestRestartDaemonAfterUpdateArgsDropsKnownUnauthenticatedNonLoopback(t *tes
 	})
 
 	assert.Equal(t, []string{
-		"serve", "--background", "--host", "127.0.0.1", "--port", "18080",
+		"serve", "--background", "--host", "127.0.0.1", "--restart-port", "18080",
 	}, args)
 }
 
@@ -187,7 +262,7 @@ func TestRestartDaemonAfterUpdateArgsKeepsLegacyNonLoopbackWithAuthConfig(t *tes
 	)
 
 	assert.Equal(t, []string{
-		"serve", "--background", "--host", "0.0.0.0", "--port", "18080",
+		"serve", "--background", "--host", "0.0.0.0", "--restart-port", "18080",
 		"--require-auth",
 	}, args)
 }

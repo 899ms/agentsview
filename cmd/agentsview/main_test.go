@@ -189,7 +189,7 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 	cfg.AgentDirs = map[parser.AgentType][]string{
 		parser.AgentClaude: {os.Getenv("AGENTSVIEW_STALE_SERVE_SOURCES")},
 	}
-	runServe(cfg, serveOptions{SkipInitialSync: true})
+	runServe(cfg, serveOptions{SkipInitialSync: true}, 0)
 }
 
 func TestPGServeRuntimeRecordWriteFailureWarnsVisible(t *testing.T) {
@@ -314,7 +314,7 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	}
 	if os.Getenv("AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_FAIL") == "true" {
 		writeDaemonRuntimeWithAuthAndNoSync = func(
-			string, string, int, string, string, bool, bool, bool, ...int,
+			string, string, int, string, string, bool, bool, bool, *int, ...int,
 		) (string, error) {
 			return "", errors.New("forced runtime-record write failure")
 		}
@@ -322,10 +322,10 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 		original := writeDaemonRuntimeWithAuthAndNoSync
 		writeDaemonRuntimeWithAuthAndNoSync = func(
 			dataDir, host string, port int, version, browserURL string, readOnly,
-			requireAuth, noSync bool, caddyPID ...int,
+			requireAuth, noSync bool, explicitPort *int, caddyPID ...int,
 		) (string, error) {
 			path, err := original(
-				dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync,
+				dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort,
 				caddyPID...,
 			)
 			fmt.Println("runtime record write reached")
@@ -343,13 +343,14 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	)
 	require.NoError(t, err)
 	time.Sleep(startupDelay)
-	runServe(config.Config{
+	cfg := config.Config{
 		Host:    "127.0.0.1",
 		Port:    0,
 		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
 		DBPath:  filepath.Join(os.Getenv("AGENTSVIEW_DATA_DIR"), "sessions.db"),
 		NoSync:  true,
-	}, serveOptions{})
+	}
+	runServe(cfg, serveOptions{}, 0)
 }
 
 func runDuckDBRuntimeWarningHelper(t *testing.T) ([]byte, error) {

@@ -30,6 +30,21 @@ type serveRuntime struct {
 	Caddy      *managedCaddy
 }
 
+func prepareRunServeRuntimeConfig(
+	cfg config.Config,
+	restartPort int,
+	onCaddyStarted func(int),
+) (config.Config, serveRuntimeOptions, error) {
+	cfg, requestedPort := applyServeRestartPort(cfg, restartPort)
+	opts := serveRuntimeOptions{
+		Mode:           "serve",
+		RequestedPort:  requestedPort,
+		OnCaddyStarted: onCaddyStarted,
+	}
+	prepared, err := prepareServeRuntimeConfig(cfg, opts)
+	return prepared, opts, err
+}
+
 func prepareServeRuntimeConfig(
 	cfg config.Config,
 	opts serveRuntimeOptions,
@@ -42,6 +57,12 @@ func prepareServeRuntimeConfig(
 	port, err := server.FindAvailablePort(cfg.Host, cfg.Port)
 	if err != nil {
 		return cfg, err
+	}
+	if cfg.PortExplicit && cfg.Port != 0 && port != cfg.Port {
+		return cfg, fmt.Errorf(
+			"requested port %d on %s is unavailable; choose another --port or use --port 0",
+			cfg.Port, cfg.Host,
+		)
 	}
 	if port != cfg.Port {
 		if cfg.Port == 0 {

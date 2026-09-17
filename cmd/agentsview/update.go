@@ -22,6 +22,7 @@ type updateDaemonStopResult struct {
 	Stopped          bool
 	Host             string
 	Port             int
+	ExplicitPort     *int
 	RequireAuth      bool
 	RequireAuthKnown bool
 	NoSync           bool
@@ -204,8 +205,10 @@ func restartDaemonAfterUpdateArgs(
 	} else if shouldForceLoopbackUpdateRestartHost(cfg, stopResult) {
 		args = append(args, "--host", "127.0.0.1")
 	}
-	if stopResult.Port > 0 {
-		args = append(args, "--port", fmt.Sprint(stopResult.Port))
+	if stopResult.ExplicitPort != nil {
+		args = append(args, "--port", fmt.Sprint(*stopResult.ExplicitPort))
+	} else if stopResult.Port > 0 {
+		args = append(args, "--restart-port", fmt.Sprint(stopResult.Port))
 	}
 	if stopResult.RequireAuth ||
 		(!stopResult.RequireAuthKnown && cfg.RequireAuth) {

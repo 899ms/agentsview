@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -470,8 +471,8 @@ func transportFromRuntime(rt *DaemonRuntime) transport {
 }
 
 // urlFromDaemonRuntime returns the HTTP URL a CLI client should use
-// to reach the daemon described by rt. Bind-all addresses are
-// mapped to loopback. IPv6 hosts are bracketed via
+// to reach the daemon described by rt, including its base path.
+// Bind-all addresses are mapped to loopback. IPv6 hosts are bracketed via
 // net.JoinHostPort so the URL is well-formed.
 func urlFromDaemonRuntime(rt *DaemonRuntime) string {
 	host := rt.Host
@@ -482,6 +483,21 @@ func urlFromDaemonRuntime(rt *DaemonRuntime) string {
 		host = "::1"
 	}
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(rt.Port)) + rt.BasePath
+}
+
+func daemonOriginURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.User = nil
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	return strings.TrimSuffix(parsed.String(), "/")
 }
 
 // newService builds the SessionService matching the detected

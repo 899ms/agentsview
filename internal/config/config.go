@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -1053,6 +1054,11 @@ func Default() (Config, error) {
 				continue
 			}
 			dirs[i] = filepath.Join(home, rel)
+		}
+		if def.Type == parser.AgentCodeBuddy && runtime.GOOS == "windows" {
+			if localAppData := os.Getenv("LOCALAPPDATA"); filepath.IsAbs(localAppData) {
+				dirs[0] = filepath.Join(localAppData, "CodeBuddyExtension", "Data")
+			}
 		}
 		// XDG_STATE_HOME replaces the state directory, including both .local
 		// and state components of the home-relative default.

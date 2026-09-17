@@ -2734,6 +2734,42 @@ schemas keep their existing ordering behavior.
   `internal/parser/workbuddy_provider.go`; counter semantics are
   implementation evidence.
 
+## CodeBuddy (`codebuddy`)
+
+- **Format:** Hierarchical session manifest (`index.json`) and individual message
+  files (`messages/*.json`). Workspace metadata lives in the parent
+  `index.json`. Message and `extra` envelopes accept JSON objects or encoded
+  JSON strings. Source text blocks are concatenated; working directories are
+  extracted independently from the user envelope. Explicit `thinking` and
+  `reasoning` content blocks are retained as thinking text.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Tencent CodeBuddy's product site and public repositories were searched 2026-09-17; no authoritative persistence producer or versioned schema is publicly published. Storage format and accounting semantics were verified against local Tencent CodeBuddy IDE and CodeBuddyExtension session data under `CodeBuddyExtension/Data/history`.
+- **Usage and cost:** The parser interprets `lastStepInputTokens` as inclusive
+  input, subtracts `lastStepCachedInputTokens` for uncached input (floored at
+  zero), and preserves `lastStepOutputTokens` and
+  `statsSnapshot.thinkingTokens` separately. Missing, null, or negative counters
+  do not establish known usage; explicit zero does. Cache-only records do not
+  establish a complete context size. Monetary cost is catalog-derived.
+- **Verification boundary:** Parser behavior was reverified on 2026-09-17 with
+  synthetic regression fixtures in `internal/parser/codebuddy_test.go`,
+  including thinking-only and usage-only messages, composite fingerprints,
+  workspace metadata changes, and deleted message events. Sync regression
+  fixtures in `internal/sync/codebuddy_integration_test.go` also verify that
+  equal-size rewrites with restored modification times invalidate both stored
+  freshness and warm skip caches through the composite content hash. Valid
+  manifests with no readable messages produce an empty session replacement,
+  clearing previously stored messages. Invalid JSON or a missing/non-array
+  `messages` field is a parse error and preserves the archive. Integration
+  fixtures cover empty manifests, deleted or invalid message files, and invalid
+  manifests after an initial import. These
+  fixtures do not independently establish producer counter semantics. The
+  original local artifact observation above has no pinned producer version; whether thinking
+  snapshots are cumulative and which releases include cached input in the input
+  counter remain unverified. Do not treat this as audited billing parity.
+- **Agentsview:** `internal/parser/codebuddy.go` and
+  `internal/parser/codebuddy_provider.go`; counter semantics are
+  implementation evidence.
+
 ## Zencoder (`zencoder`)
 
 - **Format:** Per-session JSONL transcripts.

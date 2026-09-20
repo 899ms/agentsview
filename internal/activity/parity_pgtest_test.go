@@ -33,6 +33,7 @@ import (
 	duckdbstore "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/money"
 	postgresstore "go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // parityDate is a calendar day safely in the past relative to any realistic
@@ -404,7 +405,7 @@ func pushParityPostgres(
 
 	ps, err := postgresstore.New(
 		pgURL, paritySchema, local, "parity-machine", true,
-		postgresstore.SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating pg sync")
 	t.Cleanup(func() { require.NoError(t, ps.Close()) })
@@ -440,7 +441,7 @@ func pushParityDuckDB(
 	target := filepath.Join(t.TempDir(), "parity.duckdb")
 	res, err := duckdbstore.Push(
 		ctx, target, local, "parity-machine",
-		duckdbstore.SyncOptions{}, true, nil,
+		storage.MirrorPushOptions{}, true, nil,
 	)
 	require.NoError(t, err, "pushing to duckdb")
 	require.Equal(t, len(parityFixture()), res.SessionsPushed,
@@ -466,7 +467,7 @@ func pushParityClickHouse(
 	dsn, database := chtest.FreshDatabase(t)
 	target := clickhousestore.Target{URL: dsn, Database: database}
 	syncer, err := clickhousestore.New(
-		ctx, target, local, "parity-machine", clickhousestore.SyncOptions{},
+		ctx, target, local, "parity-machine", storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating clickhouse sync")
 	t.Cleanup(func() { require.NoError(t, syncer.Close()) })

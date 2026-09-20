@@ -12,32 +12,33 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/apiclient"
-	"go.kenn.io/agentsview/internal/clickhouse"
-
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/parser"
-	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/storage"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
+// archiveWriteBackend runs pushes from the SQLite archive: in process when
+// this CLI owns the archive, or delegated to the daemon that does.
 type archiveWriteBackend interface {
-	PGPush(
+	// ReplicaPush runs one push from the archive into target through backend.
+	ReplicaPush(
 		ctx context.Context,
-		target pgTargetSelection,
-		cfg PGPushConfig,
+		backend storage.Replica,
+		target storage.ConfiguredReplica,
+		cfg ReplicaPushConfig,
 		projects []string,
 		excludeProjects []string,
-	) (postgres.PushResult, error)
+	) (storage.PushResult, error)
 	DuckDBPush(
 		ctx context.Context,
 		duckCfg config.DuckDBConfig,
 		cfg DuckDBPushConfig,
 		projects []string,
 		excludeProjects []string,
-	) (duckdbsync.PushResult, error)
+	) (storage.MirrorPushResult, error)
 	DuckDBPushWatch(
 		ctx context.Context,
 		duckCfg config.DuckDBConfig,
@@ -47,26 +48,13 @@ type archiveWriteBackend interface {
 		debounce time.Duration,
 		interval time.Duration,
 	) error
-	PGPushWatch(
+	// ReplicaPushWatch runs the long-lived watch loop that pushes into
+	// target through backend on change and on a periodic floor.
+	ReplicaPushWatch(
 		ctx context.Context,
-		target pgTargetSelection,
-		cfg PGPushConfig,
-		projects []string,
-		excludeProjects []string,
-		debounce time.Duration,
-		interval time.Duration,
-	) error
-	ClickHousePush(
-		ctx context.Context,
-		target clickHouseTargetSelection,
-		cfg ClickHousePushConfig,
-		projects []string,
-		excludeProjects []string,
-	) (clickhouse.PushResult, error)
-	ClickHousePushWatch(
-		ctx context.Context,
-		target clickHouseTargetSelection,
-		cfg ClickHousePushConfig,
+		backend storage.Replica,
+		target storage.ConfiguredReplica,
+		cfg ReplicaPushConfig,
 		projects []string,
 		excludeProjects []string,
 		debounce time.Duration,
@@ -87,17 +75,17 @@ type archivePushWatchHooks struct {
 	) (*pushLoop, func())
 	duckDBPush func(
 		context.Context, pushReason, bool,
-	) (duckdbsync.PushResult, error)
-	pgPush func(
-		context.Context, pushReason, PGPushConfig,
-	) (postgres.PushResult, error)
-	pgStartupSync func(
+	) (storage.MirrorPushResult, error)
+	replicaPush func(
+		context.Context, pushReason, ReplicaPushConfig,
+	) (storage.PushResult, error)
+	replicaStartupSync func(
 		context.Context, *syncpkg.Engine, bool,
 	) (bool, error)
 	duckDBStartupSync func(
 		context.Context, *syncpkg.Engine, bool,
 	) (bool, error)
-	newPGPusher        func(*syncpkg.Engine) *pgPusher
+	newReplicaPusher   func(*syncpkg.Engine) *replicaPusher
 	newDuckDBPusher    func(*syncpkg.Engine) *duckDBPusher
 	newUnwatchedPoller func(context.Context, unwatchedPollSyncer) unwatchedRootPoller
 }
@@ -209,7 +197,7 @@ func archivePushWatchBatchCallback(
 }
 
 func completeDuckDBWatchPush(
-	res duckdbsync.PushResult, reason pushReason,
+	res storage.MirrorPushResult, reason pushReason,
 ) error {
 	logDuckDBWatchPushResult(res, reason)
 	if res.Errors > 0 {
@@ -218,8 +206,10 @@ func completeDuckDBWatchPush(
 	return nil
 }
 
-func completePGWatchPush(res postgres.PushResult, reason pushReason) error {
-	logPGWatchPushResult(res, reason)
+func completeReplicaWatchPush(
+	label, displayName string, res storage.PushResult, reason pushReason,
+) error {
+	logReplicaWatchPushResult(label, displayName, res, reason)
 	if res.Errors > 0 {
 		return fmt.Errorf("%d session(s) failed to push", res.Errors)
 	}
@@ -497,34 +487,37 @@ func daemonPushProgress[P any](
 	}
 }
 
-func (b daemonArchiveWriteBackend) PGPush(
+func (b daemonArchiveWriteBackend) ReplicaPush(
 	ctx context.Context,
-	target pgTargetSelection,
-	cfg PGPushConfig,
+	backend storage.Replica,
+	target storage.ConfiguredReplica,
+	cfg ReplicaPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (postgres.PushResult, error) {
+) (storage.PushResult, error) {
+	operation, err := replicaPushOperation(backend.Name())
+	if err != nil {
+		return storage.PushResult{}, err
+	}
 	onProgress, finish := daemonPushProgress(
-		"PostgreSQL", newPGPushProgressPrinter(),
+		backend.DisplayName(), newReplicaPushProgressPrinter(),
 	)
 	defer finish()
-	return postDaemonPush[postgres.PushResult](
-		ctx, b.tr, b.appCfg.AuthToken, daemonPushPG,
+	return postDaemonPush[storage.PushResult](
+		ctx, b.tr, b.appCfg.AuthToken, operation,
 		apiclient.DaemonPushRequest{
 			Full:            cfg.Full,
 			Projects:        projects,
 			ExcludeProjects: excludeProjects,
-			Pg: &apiclient.ConfigPGConfig{
-				URL:             target.PG.URL,
-				Schema:          target.PG.Schema,
-				MachineName:     target.PG.MachineName,
-				AllowInsecure:   target.PG.AllowInsecure,
-				Projects:        target.PG.Projects,
-				ExcludeProjects: target.PG.ExcludeProjects,
-				PushVectors:     target.PG.PushVectors,
+			Replica: &apiclient.DaemonReplicaTarget{
+				URL:           target.Target.URL,
+				Schema:        new(target.Target.Schema),
+				MachineName:   target.Target.MachineName,
+				AllowInsecure: new(target.Target.AllowInsecure),
+				PushVectors:   new(target.Target.PushVectors),
 			},
-			SyncStateTarget:                new(target.SyncStateTarget),
-			MigrateLegacySyncState:         new(target.MigrateLegacySyncState),
+			SyncStateTarget:                new(target.SyncStateTarget()),
+			MigrateLegacySyncState:         new(target.MigrateLegacySyncState()),
 			NoVectors:                      new(cfg.NoVectors),
 			ScopeVectorsToChangedSessions:  new(cfg.ScopeVectorsToChangedSessions),
 			LastReconciledVectorGeneration: new(cfg.LastReconciledVectorGeneration),
@@ -535,120 +528,13 @@ func (b daemonArchiveWriteBackend) PGPush(
 	)
 }
 
-func (b daemonArchiveWriteBackend) ClickHousePush(
-	ctx context.Context,
-	target clickHouseTargetSelection,
-	cfg ClickHousePushConfig,
-	projects []string,
-	excludeProjects []string,
-) (clickhouse.PushResult, error) {
-	onProgress, finish := daemonPushProgress(
-		"ClickHouse", newClickHousePushProgressPrinter(),
-	)
-	defer finish()
-	return postDaemonPush[clickhouse.PushResult](
-		ctx, b.tr, b.appCfg.AuthToken, daemonPushClickHouse,
-		apiclient.DaemonPushRequest{
-			Full:            cfg.Full,
-			Projects:        projects,
-			ExcludeProjects: excludeProjects,
-			Clickhouse: &apiclient.ConfigClickHouseConfig{
-				URL:             target.Config.URL,
-				Database:        target.Config.Database,
-				MachineName:     target.Config.MachineName,
-				AllowInsecure:   target.Config.AllowInsecure,
-				Projects:        target.Config.Projects,
-				ExcludeProjects: target.Config.ExcludeProjects,
-			},
-			WatchBatch:    generatedWatchBatch(cfg.WatchBatch),
-			WatchRecovery: generatedWatchRecovery(cfg.WatchRecovery),
-		},
-		onProgress,
-	)
-}
-
-func (b daemonArchiveWriteBackend) ClickHousePushWatch(
-	ctx context.Context,
-	target clickHouseTargetSelection,
-	cfg ClickHousePushConfig,
-	projects []string,
-	exclude []string,
-	debounce time.Duration,
-	interval time.Duration,
-) error {
-	if interval <= 0 {
-		interval = defaultWatchInterval
-	}
-	if debounce <= 0 {
-		debounce = defaultWatchDebounce
-	}
-	push := func(
-		pctx context.Context, reason pushReason, full bool,
-		batch *syncpkg.WatchBatch,
-	) error {
-		pushCfg := cfg
-		pushCfg.Full = full
-		pushCfg.WatchBatch = batch
-		pushCfg.WatchRecovery = watchRecoveryForBatch(b.appCfg, batch)
-		var res clickhouse.PushResult
-		var err error
-		backend := archiveWriteBackend(b)
-		cleanup := func() {}
-		if reason != reasonStartup {
-			backend, cleanup, err = resolveArchiveWriteBackend(pctx, b.appCfg)
-			if err != nil {
-				return err
-			}
-		}
-		defer cleanup()
-		res, err = backend.ClickHousePush(
-			pctx, target, pushCfg, projects, exclude,
-		)
-		if err != nil {
-			return err
-		}
-		return completeClickHouseWatchPush(res, reason)
-	}
-	loop, stopLoop := newArchivePushLoop(
-		b.watchHooks, "clickhouse watch", debounce, interval,
-		func(c context.Context, r pushReason, batch *syncpkg.WatchBatch) error {
-			return push(c, r, false, batch)
-		},
-	)
-	defer stopLoop()
-
-	stopWatcher, openDispatch, unwatchedDirs := startArchivePushWatcher(
-		b.watchHooks, b.appCfg, nil,
-		func(callbackCtx context.Context, batch syncpkg.WatchBatch) error {
-			return notifyPushForWatchBatchWithConfig(
-				callbackCtx, loop, b.appCfg, batch,
-			)
-		},
-		syncpkg.WatcherOptions{OnCoverageDegraded: loop.NotifyCoverageDegraded},
-	)
-	defer stopWatcher()
-	if len(unwatchedDirs) > 0 {
-		log.Printf(
-			"clickhouse watch: %d root(s) not watched; relying on the %s floor for coverage",
-			len(unwatchedDirs), interval,
-		)
-	}
-	initialErr := push(ctx, reasonStartup, cfg.Full, nil)
-	if initialErr != nil {
-		log.Printf("clickhouse watch: initial daemon push failed: %v", initialErr)
-	}
-	completePushWatchStartup(ctx, initialErr, loop, openDispatch)
-	loop.Run(ctx)
-	return nil
-}
-
 func (b daemonArchiveWriteBackend) DuckDBPush(
 	ctx context.Context,
 	duckCfg config.DuckDBConfig,
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (duckdbsync.PushResult, error) {
+) (storage.MirrorPushResult, error) {
 	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
@@ -678,7 +564,7 @@ func (b daemonArchiveWriteBackend) DuckDBPushWatch(
 		// every changed batch, and archive-scale diagnostics are
 		// skipped. Push ignores the defer behavior when full is set.
 		pushCfg.Automatic = true
-		var res duckdbsync.PushResult
+		var res storage.MirrorPushResult
 		var err error
 		if b.watchHooks != nil && b.watchHooks.duckDBPush != nil {
 			res, err = b.watchHooks.duckDBPush(pctx, reason, full)
@@ -744,9 +630,9 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (duckdbsync.PushResult, error) {
-	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
-		return duckdbsync.PushResult{}, err
+) (storage.MirrorPushResult, error) {
+	if err := mirrorBackend.ValidatePushTarget(duckCfg); err != nil {
+		return storage.MirrorPushResult{}, err
 	}
 	// Never send a mirror path to the daemon: the daemon pins pushes to its
 	// own resolved path and rejects any request naming a different one, and
@@ -756,7 +642,7 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 	// non-path fields (machine name, filters) still apply.
 	duckCfg.Path = ""
 	onProgress, finish := daemonPushProgress(
-		"DuckDB", func(p duckdbsync.PushProgress) {
+		mirrorBackend.DisplayName(), func(p storage.MirrorPushProgress) {
 			fmt.Printf(
 				"\rPushing... %d/%d sessions, %d messages\x1b[K",
 				p.SessionsDone, p.SessionsTotal, p.MessagesDone,
@@ -764,8 +650,8 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 		},
 	)
 	defer finish()
-	return postDaemonPush[duckdbsync.PushResult](
-		ctx, b.tr, b.appCfg.AuthToken, daemonPushDuckDB,
+	return postDaemonPush[storage.MirrorPushResult](
+		ctx, b.tr, b.appCfg.AuthToken, mirrorPushOperation,
 		apiclient.DaemonPushRequest{
 			Full:            cfg.Full,
 			Projects:        projects,
@@ -786,10 +672,11 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 	)
 }
 
-func (b daemonArchiveWriteBackend) PGPushWatch(
+func (b daemonArchiveWriteBackend) ReplicaPushWatch(
 	ctx context.Context,
-	target pgTargetSelection,
-	cfg PGPushConfig,
+	backend storage.Replica,
+	target storage.ConfiguredReplica,
+	cfg ReplicaPushConfig,
 	projects []string,
 	exclude []string,
 	debounce time.Duration,
@@ -801,10 +688,11 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 	if debounce <= 0 {
 		debounce = defaultWatchDebounce
 	}
-	// Daemon-delegated pushes build a fresh postgres.Sync per request,
-	// so the vector reconcile bit and the last-reconciled generation id
-	// live here, in the long-lived watch process, mirroring pgPusher's
+	// Daemon-delegated pushes build a fresh pusher per request, so the
+	// vector reconcile bit and the last-reconciled generation id live
+	// here, in the long-lived watch process, mirroring replicaPusher's
 	// local-mode state.
+	label := backend.Name() + " watch"
 	vectorReconcileNeeded := true
 	lastReconciledVectorGeneration := int64(0)
 	push := func(
@@ -818,15 +706,15 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 		scoped := scopedVectorPush(reason, full, vectorReconcileNeeded)
 		pushCfg.ScopeVectorsToChangedSessions = scoped
 		pushCfg.LastReconciledVectorGeneration = lastReconciledVectorGeneration
-		var res postgres.PushResult
+		var res storage.PushResult
 		var err error
-		if b.watchHooks != nil && b.watchHooks.pgPush != nil {
-			res, err = b.watchHooks.pgPush(pctx, reason, pushCfg)
+		if b.watchHooks != nil && b.watchHooks.replicaPush != nil {
+			res, err = b.watchHooks.replicaPush(pctx, reason, pushCfg)
 		} else {
-			backend := archiveWriteBackend(b)
+			writer := archiveWriteBackend(b)
 			cleanup := func() {}
 			if reason != reasonStartup {
-				backend, cleanup, err = resolveArchiveWriteBackend(
+				writer, cleanup, err = resolveArchiveWriteBackend(
 					pctx, b.appCfg,
 				)
 				if err != nil {
@@ -834,8 +722,8 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 				}
 			}
 			defer cleanup()
-			res, err = backend.PGPush(
-				pctx, target, pushCfg, projects, exclude,
+			res, err = writer.ReplicaPush(
+				pctx, backend, target, pushCfg, projects, exclude,
 			)
 		}
 		if err != nil {
@@ -846,10 +734,10 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 			vectorReconcileNeeded,
 			lastReconciledVectorGeneration, scoped, res,
 		)
-		return completePGWatchPush(res, reason)
+		return completeReplicaWatchPush(label, backend.DisplayName(), res, reason)
 	}
 	loop, stopLoop := newArchivePushLoop(
-		b.watchHooks, "pg watch", debounce, interval,
+		b.watchHooks, label, debounce, interval,
 		func(c context.Context, r pushReason, batch *syncpkg.WatchBatch) error {
 			return push(c, r, false, batch)
 		},
@@ -898,11 +786,14 @@ func (b *localArchiveWriteBackend) ensureCurrentPricing(
 	return pricingrefresh.EnsureCurrent(ctx, b.database)
 }
 
-func (b *localArchiveWriteBackend) newPGPusher(
+func (b *localArchiveWriteBackend) newReplicaPusher(
+	backend storage.Replica,
 	localSync func(context.Context) error,
-	connect func() (pgTarget, error),
-) *pgPusher {
-	return &pgPusher{
+	connect func(context.Context) (storage.Pusher, error),
+) *replicaPusher {
+	return &replicaPusher{
+		label:         backend.Name() + " watch",
+		displayName:   backend.DisplayName(),
 		localSync:     localSync,
 		ensurePricing: b.ensureCurrentPricing,
 		connect:       connect,
@@ -912,150 +803,73 @@ func (b *localArchiveWriteBackend) newPGPusher(
 	}
 }
 
-func (b *localArchiveWriteBackend) PGPush(
+func (b *localArchiveWriteBackend) ReplicaPush(
 	ctx context.Context,
-	target pgTargetSelection,
-	cfg PGPushConfig,
+	backend storage.Replica,
+	target storage.ConfiguredReplica,
+	cfg ReplicaPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (postgres.PushResult, error) {
+) (storage.PushResult, error) {
+	display := backend.DisplayName()
 	didResync, err := runLocalSyncAuthoritative(
 		ctx, b.appCfg, b.database, cfg.Full,
 	)
 	if err != nil {
-		return postgres.PushResult{}, err
+		return storage.PushResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return postgres.PushResult{}, err
+		return storage.PushResult{}, err
 	}
 	if err := b.ensureCurrentPricing(ctx); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return postgres.PushResult{}, ctxErr
+			return storage.PushResult{}, ctxErr
 		}
 		log.Printf("warning: pricing refresh failed: %v", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return postgres.PushResult{}, err
+		return storage.PushResult{}, err
 	}
 	forceFull := cfg.Full || didResync
 
-	fmt.Println("Connecting to PostgreSQL...")
+	fmt.Printf("Connecting to %s...\n", display)
 	connectStart := time.Now()
 	applyClassifierConfig(b.appCfg)
-	vectorSource := pgVectorPushSource(b.appCfg, target, cfg)
+	vectorSource := replicaVectorPushSource(b.appCfg, target, cfg)
 	defer closeVectorPushSource(vectorSource)
-	ps, err := postgres.New(
-		target.PG.URL, target.PG.Schema, b.database,
-		target.PG.MachineName, target.PG.AllowInsecure,
-		target.syncOptions(projects, excludeProjects, vectorSource),
+	ps, err := backend.NewPusher(
+		ctx, target.Target, b.database,
+		replicaPusherOptions(target, projects, excludeProjects, vectorSource),
 	)
 	if err != nil {
-		return postgres.PushResult{}, err
+		return storage.PushResult{}, err
 	}
 	defer ps.Close()
 	fmt.Printf(
-		"Connected to PostgreSQL in %s\n",
+		"Connected to %s in %s\n", display,
 		time.Since(connectStart).Round(time.Millisecond),
 	)
 
-	fmt.Println("Preparing PostgreSQL schema...")
+	fmt.Printf("Preparing %s schema...\n", display)
 	schemaStart := time.Now()
 	if err := ps.EnsureSchema(ctx); err != nil {
-		return postgres.PushResult{}, fmt.Errorf("schema: %w", err)
+		return storage.PushResult{}, fmt.Errorf("schema: %w", err)
 	}
 	fmt.Printf(
-		"PostgreSQL schema ready in %s\n",
+		"%s schema ready in %s\n", display,
 		time.Since(schemaStart).Round(time.Millisecond),
 	)
-	fmt.Println("Starting PostgreSQL push...")
-	result, err := ps.PushWithOptions(ctx, postgres.PushOptions{
+	fmt.Printf("Starting %s push...\n", display)
+	result, err := ps.PushWithOptions(ctx, storage.PushOptions{
 		Full: forceFull,
 		ScopeVectorsToChangedSessions: cfg.
 			ScopeVectorsToChangedSessions,
 		LastReconciledVectorGeneration: cfg.
 			LastReconciledVectorGeneration,
-	}, newPGPushProgressPrinter())
+	}, newReplicaPushProgressPrinter())
 	fmt.Print("\r\033[K")
 	if err != nil {
-		return postgres.PushResult{}, err
-	}
-	return result, nil
-}
-
-func (b *localArchiveWriteBackend) ClickHousePush(
-	ctx context.Context,
-	target clickHouseTargetSelection,
-	cfg ClickHousePushConfig,
-	projects []string,
-	excludeProjects []string,
-) (clickhouse.PushResult, error) {
-	didResync, err := runLocalSyncAuthoritative(
-		ctx, b.appCfg, b.database, cfg.Full,
-	)
-	if err != nil {
-		return clickhouse.PushResult{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return clickhouse.PushResult{}, err
-	}
-	if err := b.ensureCurrentPricing(ctx); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return clickhouse.PushResult{}, ctxErr
-		}
-		log.Printf("warning: pricing refresh failed: %v", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return clickhouse.PushResult{}, err
-	}
-	forceFull := cfg.Full || didResync
-	return b.clickHouseMirrorPush(ctx, target, projects, excludeProjects, forceFull)
-}
-
-func (b *localArchiveWriteBackend) clickHouseMirrorPush(
-	ctx context.Context,
-	target clickHouseTargetSelection,
-	projects, excludeProjects []string,
-	forceFull bool,
-) (clickhouse.PushResult, error) {
-	if err := clickhouse.CheckTransportSecurity(
-		target.Config.URL, target.Config.AllowInsecure,
-	); err != nil {
-		return clickhouse.PushResult{}, err
-	}
-
-	fmt.Println("Connecting to ClickHouse...")
-	connectStart := time.Now()
-	applyClassifierConfig(b.appCfg)
-	syncer, err := clickhouse.New(
-		ctx, clickHouseTarget(target.Config), b.database,
-		target.Config.MachineName,
-		clickhouse.SyncOptions{Projects: projects, ExcludeProjects: excludeProjects},
-	)
-	if err != nil {
-		return clickhouse.PushResult{}, err
-	}
-	defer syncer.Close()
-	fmt.Printf(
-		"Connected to ClickHouse in %s\n",
-		time.Since(connectStart).Round(time.Millisecond),
-	)
-
-	fmt.Println("Preparing ClickHouse schema...")
-	schemaStart := time.Now()
-	if err := syncer.EnsureSchema(ctx); err != nil {
-		return clickhouse.PushResult{}, fmt.Errorf("schema: %w", err)
-	}
-	fmt.Printf(
-		"ClickHouse schema ready in %s\n",
-		time.Since(schemaStart).Round(time.Millisecond),
-	)
-	fmt.Println("Starting ClickHouse push...")
-	result, err := syncer.PushWithOptions(ctx, clickhouse.PushOptions{
-		Full: forceFull,
-	}, newClickHousePushProgressPrinter())
-	fmt.Print("\r\033[K")
-	if err != nil {
-		return clickhouse.PushResult{}, err
+		return storage.PushResult{}, err
 	}
 	return result, nil
 }
@@ -1066,7 +880,7 @@ func (b *localArchiveWriteBackend) DuckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (duckdbsync.PushResult, error) {
+) (storage.MirrorPushResult, error) {
 	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
@@ -1076,15 +890,15 @@ func (b *localArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-) (duckdbsync.PushResult, error) {
-	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
-		return duckdbsync.PushResult{}, err
+) (storage.MirrorPushResult, error) {
+	if err := mirrorBackend.ValidatePushTarget(duckCfg); err != nil {
+		return storage.MirrorPushResult{}, err
 	}
 	didResync, err := runLocalSyncAuthoritative(
 		ctx, b.appCfg, b.database, cfg.Full,
 	)
 	if err != nil {
-		return duckdbsync.PushResult{}, err
+		return storage.MirrorPushResult{}, err
 	}
 	forceFull := cfg.Full || didResync
 
@@ -1101,18 +915,18 @@ func (b *localArchiveWriteBackend) duckDBMirrorPush(
 	projects []string,
 	excludeProjects []string,
 	forceFull bool,
-) (duckdbsync.PushResult, error) {
-	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
-		return duckdbsync.PushResult{}, err
+) (storage.MirrorPushResult, error) {
+	if err := mirrorBackend.ValidatePushTarget(duckCfg); err != nil {
+		return storage.MirrorPushResult{}, err
 	}
-	opts := duckdbsync.SyncOptions{
+	opts := storage.MirrorPushOptions{
 		Projects:        projects,
 		ExcludeProjects: excludeProjects,
 		Automatic:       cfg.Automatic,
 	}
-	result, err := duckdbsync.Push(
-		ctx, duckCfg.Path, b.database, duckCfg.MachineName, opts, forceFull,
-		func(p duckdbsync.PushProgress) {
+	result, err := mirrorBackend.Push(
+		ctx, duckCfg, b.database, opts, forceFull,
+		func(p storage.MirrorPushProgress) {
 			fmt.Printf(
 				"\rPushing... %d/%d sessions, %d messages\x1b[K",
 				p.SessionsDone, p.SessionsTotal, p.MessagesDone,
@@ -1121,7 +935,7 @@ func (b *localArchiveWriteBackend) duckDBMirrorPush(
 	)
 	fmt.Print("\r\033[K")
 	if err != nil {
-		return duckdbsync.PushResult{}, err
+		return storage.MirrorPushResult{}, err
 	}
 	return result, nil
 }
@@ -1151,7 +965,7 @@ func (b *localArchiveWriteBackend) newDuckDBPusher(
 		},
 		ensurePricing: b.ensureCurrentPricing,
 		mirrorPush: func(c context.Context, forceFull bool) (
-			duckdbsync.PushResult, error,
+			storage.MirrorPushResult, error,
 		) {
 			return b.duckDBMirrorPush(
 				c, duckCfg, pushCfg, projects, exclude, forceFull,
@@ -1263,7 +1077,7 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 	return nil
 }
 
-func logDuckDBWatchPushResult(res duckdbsync.PushResult, reason pushReason) {
+func logDuckDBWatchPushResult(res storage.MirrorPushResult, reason pushReason) {
 	if res.Diagnostics.Deferred {
 		log.Printf(
 			"duckdb watch: push deferred: %s (%s)",
@@ -1293,39 +1107,11 @@ func logDuckDBWatchPushResult(res duckdbsync.PushResult, reason pushReason) {
 	)
 }
 
-func (b *localArchiveWriteBackend) newClickHousePusher(
-	engine *syncpkg.Engine,
-	target clickHouseTargetSelection,
-	projects, exclude []string,
-) *clickHousePusher {
-	return &clickHousePusher{
-		localSync: func(c context.Context) error {
-			stats := engine.SyncAll(c, nil)
-			if err := c.Err(); err != nil {
-				return err
-			}
-			if !stats.AuthoritativeDiscoveryComplete() {
-				return errors.New("local sync discovery incomplete")
-			}
-			if !stats.ProcessingComplete() {
-				return errors.New("local sync processing incomplete")
-			}
-			engine.FlushSignals()
-			return nil
-		},
-		ensurePricing: b.ensureCurrentPricing,
-		mirrorPush: func(c context.Context, forceFull bool) (
-			clickhouse.PushResult, error,
-		) {
-			return b.clickHouseMirrorPush(c, target, projects, exclude, forceFull)
-		},
-	}
-}
-
-func (b *localArchiveWriteBackend) ClickHousePushWatch(
+func (b *localArchiveWriteBackend) ReplicaPushWatch(
 	ctx context.Context,
-	target clickHouseTargetSelection,
-	cfg ClickHousePushConfig,
+	backend storage.Replica,
+	target storage.ConfiguredReplica,
+	cfg ReplicaPushConfig,
 	projects []string,
 	exclude []string,
 	debounce time.Duration,
@@ -1358,115 +1144,20 @@ func (b *localArchiveWriteBackend) ClickHousePushWatch(
 	})
 	defer engine.Close()
 
-	pusher := b.newClickHousePusher(engine, target, projects, exclude)
-	pusher.scopedSync = func(
-		c context.Context,
-		batch syncpkg.WatchBatch,
-		recovery *syncpkg.WatchRecoveryScope,
-		work func() error,
-	) error {
-		_, err := engine.SyncWatchBatchThenRun(c, batch, recovery, work)
-		return err
-	}
-
-	loop, stopLoop := newArchivePushLoop(
-		b.watchHooks,
-		"clickhouse watch", debounce, interval,
-		func(c context.Context, r pushReason, batch *syncpkg.WatchBatch) error {
-			return pusher.pushBatch(
-				c, r, false, batch, watchRecoveryForBatch(b.appCfg, batch),
-			)
-		},
-	)
-	defer stopLoop()
-
-	poller := newArchivePushUnwatchedPoller(ctx, b.watchHooks, engine)
-	defer poller.Stop()
-
-	stopWatcher, openDispatch, unwatchedDirs := startArchivePushWatcher(
-		b.watchHooks, b.appCfg, engine,
-		archivePushWatchBatchCallback(b.appCfg, loop),
-		archivePushWatchWatcherOptions(loop, poller),
-	)
-	defer stopWatcher()
-	if len(unwatchedDirs) > 0 {
-		log.Printf(
-			"clickhouse watch: %d root(s) not watched; polling every %s",
-			len(unwatchedDirs), unwatchedPollInterval,
-		)
-	}
-
-	startupSync := runPGWatchStartupSync
-	if b.watchHooks != nil && b.watchHooks.duckDBStartupSync != nil {
-		startupSync = b.watchHooks.duckDBStartupSync
-	}
-	didResync, startupErr := startupSync(ctx, engine, cfg.Full)
-	if startupErr != nil && errors.Is(startupErr, context.Canceled) {
-		return nil
-	}
-	initialErr := startupErr
-	if initialErr == nil {
-		initialErr = pusher.push(ctx, reasonStartup, didResync)
-	}
-	if initialErr != nil {
-		if errors.Is(initialErr, context.Canceled) && ctx.Err() != nil {
-			return nil
-		}
-		log.Printf("clickhouse watch: initial push failed: %v", initialErr)
-	}
-	completePushWatchStartup(ctx, initialErr, loop, openDispatch)
-	loop.Run(ctx)
-	return nil
-}
-
-func (b *localArchiveWriteBackend) PGPushWatch(
-	ctx context.Context,
-	target pgTargetSelection,
-	cfg PGPushConfig,
-	projects []string,
-	exclude []string,
-	debounce time.Duration,
-	interval time.Duration,
-) error {
-	if interval <= 0 {
-		interval = defaultWatchInterval
-	}
-	if debounce <= 0 {
-		debounce = defaultWatchDebounce
-	}
-	for _, def := range parser.Registry {
-		if !b.appCfg.IsUserConfigured(def.Type) {
-			continue
-		}
-		warnMissingDirs(b.appCfg.ResolveDirs(def.Type), string(def.Type))
-	}
-	cleanResyncTemp(b.appCfg.DBPath)
-
-	engine := syncpkg.NewEngine(ctx, b.database, syncpkg.EngineConfig{
-		AgentDirs:               b.appCfg.AgentDirs,
-		SourceMachines:          b.appCfg.SourceMachines,
-		ProviderMetadata:        b.appCfg.ProviderMetadata,
-		DisabledAgents:          b.appCfg.DisabledAgents,
-		IncludeCwdPrefixes:      b.appCfg.SyncIncludeCwdPrefixes,
-		ScanProtectedPaths:      b.appCfg.ScanProtectedPaths,
-		Machine:                 b.appCfg.InstallationID,
-		BlockedResultCategories: b.appCfg.ResultContentBlockedCategories,
-		ArchiveContent:          b.appCfg.ArchiveContent,
-	})
-	defer engine.Close()
-
-	var pusher *pgPusher
-	if b.watchHooks != nil && b.watchHooks.newPGPusher != nil {
-		pusher = b.watchHooks.newPGPusher(engine)
+	name := backend.Name()
+	var pusher *replicaPusher
+	if b.watchHooks != nil && b.watchHooks.newReplicaPusher != nil {
+		pusher = b.watchHooks.newReplicaPusher(engine)
 	} else {
 		// One vectors.db adapter for the watch loop's lifetime: connect runs on
 		// every reconnect, and a fresh source per reconnect would leak the
-		// previous one's memoized read-only handle (postgres.Sync never closes
+		// previous one's memoized read-only handle (the pusher never closes
 		// its source). The adapter is designed for reuse — it reopens lazily
 		// after transient failures.
-		vectorSource := pgVectorPushSource(b.appCfg, target, cfg)
+		vectorSource := replicaVectorPushSource(b.appCfg, target, cfg)
 		defer closeVectorPushSource(vectorSource)
-		pusher = b.newPGPusher(
+		pusher = b.newReplicaPusher(
+			backend,
 			func(c context.Context) error {
 				stats := engine.SyncAll(c, nil)
 				if err := c.Err(); err != nil {
@@ -1484,17 +1175,12 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 				engine.FlushSignals()
 				return nil
 			},
-			func() (pgTarget, error) {
+			func(c context.Context) (storage.Pusher, error) {
 				applyClassifierConfig(b.appCfg)
-				s, cErr := postgres.New(
-					target.PG.URL, target.PG.Schema, b.database,
-					target.PG.MachineName, target.PG.AllowInsecure,
-					target.syncOptions(projects, exclude, vectorSource),
+				return backend.NewPusher(
+					c, target.Target, b.database,
+					replicaPusherOptions(target, projects, exclude, vectorSource),
 				)
-				if cErr != nil {
-					return nil, cErr
-				}
-				return s, nil
 			},
 		)
 	}
@@ -1510,13 +1196,13 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 	defer pusher.reset()
 
 	fmt.Printf(
-		"agentsview pg watch: pushing to PostgreSQL as %q "+
+		"agentsview %s watch: pushing to %s as %q "+
 			"(debounce %s, floor %s)\n",
-		target.PG.MachineName, debounce, interval,
+		name, backend.DisplayName(), target.Target.MachineName, debounce, interval,
 	)
 
 	loop, stopLoop := newArchivePushLoop(
-		b.watchHooks, "pg watch", debounce, interval,
+		b.watchHooks, name+" watch", debounce, interval,
 		func(c context.Context, r pushReason, batch *syncpkg.WatchBatch) error {
 			return pusher.pushBatch(
 				c, r, false, batch, watchRecoveryForBatch(b.appCfg, batch),
@@ -1542,8 +1228,8 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 	}
 
 	startupSync := runPGWatchStartupSync
-	if b.watchHooks != nil && b.watchHooks.pgStartupSync != nil {
-		startupSync = b.watchHooks.pgStartupSync
+	if b.watchHooks != nil && b.watchHooks.replicaStartupSync != nil {
+		startupSync = b.watchHooks.replicaStartupSync
 	}
 	didResync, startupErr := startupSync(ctx, engine, cfg.Full)
 	if startupErr != nil && errors.Is(startupErr, context.Canceled) {
@@ -1604,4 +1290,20 @@ func generatedWatchRecovery(scope *syncpkg.WatchRecoveryScope) *apiclient.SyncWa
 		return nil
 	}
 	return &apiclient.SyncWatchRecoveryScope{AvailableRoots: scope.AvailableRoots, DeferredRoots: scope.DeferredRoots}
+}
+
+// replicaPusherOptions scopes one push session to the target's sync-state
+// keys and the effective project filters.
+func replicaPusherOptions(
+	target storage.ConfiguredReplica,
+	projects, excludeProjects []string,
+	vectorSource storage.VectorPushSource,
+) storage.PusherOptions {
+	return storage.PusherOptions{
+		Projects:               projects,
+		ExcludeProjects:        excludeProjects,
+		SyncStateTarget:        target.SyncStateTarget(),
+		MigrateLegacySyncState: target.MigrateLegacySyncState(),
+		VectorSource:           vectorSource,
+	}
 }

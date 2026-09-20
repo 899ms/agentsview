@@ -11,10 +11,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"go.kenn.io/agentsview/internal/clickhouse"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func newPGServiceCommand() *cobra.Command {
@@ -221,48 +220,17 @@ func readServiceLastPush(ctx context.Context,
 	appCfg config.Config,
 	database *db.DB,
 ) (string, error) {
-	if kind.Name == "clickhouse" {
-		targets, err := resolveClickHouseTargetSelections(appCfg, "", false)
-		if err != nil {
-			return "", err
-		}
-		target, err := resolveClickHouseTargetConfig(appCfg, targets[0])
-		if err != nil {
-			return "", err
-		}
-		if err := clickhouse.CheckTransportSecurity(
-			target.Config.URL, target.Config.AllowInsecure,
-		); err != nil {
-			return "", err
-		}
-		archiveID, err := database.GetArchiveID(ctx)
-		if err != nil {
-			return "", err
-		}
-		status, err := clickhouse.ReadStatus(
-			ctx, clickHouseTarget(target.Config), target.Config.MachineName, archiveID,
-			nil, nil,
-		)
-		if err != nil {
-			return "", err
-		}
-		return status.LastPushAt, nil
-	}
-	targets, err := resolvePGTargetSelections(appCfg, "", false)
+	backend, err := replicaBackendNamed(kind.Name)
 	if err != nil {
 		return "", err
 	}
-	target := targets[0]
-	target, err = resolvePGTargetConfig(appCfg, target)
+	target, err := storage.DefaultTarget(backend, appCfg)
 	if err != nil {
 		return "", err
 	}
-	return postgres.ReadLastPushAt(ctx,
-		database,
-		target.SyncStateTarget,
-		target.PG.Projects,
-		target.PG.ExcludeProjects,
-		target.MigrateLegacySyncState,
+	return backend.LastPushAt(
+		ctx, database, target,
+		target.Projects, target.ExcludeProjects,
 	)
 }
 

@@ -18,15 +18,18 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/clickhouse"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
-// stubVectorPushSource is a no-op postgres.VectorPushSource: the gating test
+// stubVectorPushSource is a no-op storage.VectorPushSource: the gating test
 // only needs identity, never a method call.
 type stubVectorPushSource struct{}
 
@@ -52,7 +55,7 @@ func TestDaemonPushRequestWatchTransportJSON(t *testing.T) {
 
 func (stubVectorPushSource) BeginExport(
 	context.Context, []string,
-) (postgres.VectorExport, bool, error) {
+) (storage.VectorExport, bool, error) {
 	return nil, false, nil
 }
 
@@ -69,15 +72,15 @@ func TestPGPushProgressLoggerThrottlesAndReportsPhases(t *testing.T) {
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
-	logProgress := newPGPushProgressLogger()
-	logProgress(postgres.PushProgress{SessionsDone: 1, SessionsTotal: 10, MessagesDone: 5})
-	logProgress(postgres.PushProgress{SessionsDone: 2, SessionsTotal: 10, MessagesDone: 9})
+	logProgress := newReplicaPushProgressLogger("pg")
+	logProgress(storage.PushProgress{SessionsDone: 1, SessionsTotal: 10, MessagesDone: 5})
+	logProgress(storage.PushProgress{SessionsDone: 2, SessionsTotal: 10, MessagesDone: 9})
 	assert.Contains(t, buf.String(), "pg push: 1/10 session(s), 5 messages")
 	assert.NotContains(t, buf.String(), "2/10",
 		"second report inside the throttle window must not log")
 
 	pushProgressLogInterval = 0
-	logProgress(postgres.PushProgress{
+	logProgress(storage.PushProgress{
 		Phase:               "vectors",
 		VectorSessionsDone:  3,
 		VectorSessionsTotal: 7,
@@ -86,31 +89,30 @@ func TestPGPushProgressLoggerThrottlesAndReportsPhases(t *testing.T) {
 	assert.Contains(t, buf.String(),
 		"pg push: vectors 3/7 session(s) scanned, 42 chunks")
 
-	logProgress(postgres.PushProgress{
+	logProgress(storage.PushProgress{
 		Phase:         "preparing",
 		SessionsDone:  500,
 		SessionsTotal: 46000,
 	})
 	assert.Contains(t, buf.String(), "pg push: preparing 500/46000 session(s)")
 
-	logProgress(postgres.PushProgress{Phase: "preparing"})
+	logProgress(storage.PushProgress{Phase: "preparing"})
 	assert.Contains(t, buf.String(),
 		"pg push: preparing (sync state, metadata, fingerprints)",
 		"zero-total preparing report renders the setup-stage line")
 }
 
 func TestPGPushVectorSourceGating(t *testing.T) {
-	disabled := false
 	tests := []struct {
 		name      string
 		wired     bool
-		pushFlag  *bool
+		optOut    bool
 		noVectors bool
 		wantSrc   bool
 	}{
 		{name: "wired and enabled", wired: true, wantSrc: true},
 		{name: "no source wired", wired: false, wantSrc: false},
-		{name: "target opts out", wired: true, pushFlag: &disabled, wantSrc: false},
+		{name: "target opts out", wired: true, optOut: true, wantSrc: false},
 		{name: "caller passed --no-vectors", wired: true, noVectors: true, wantSrc: false},
 	}
 	for _, tt := range tests {
@@ -119,8 +121,8 @@ func TestPGPushVectorSourceGating(t *testing.T) {
 			if tt.wired {
 				s.vectorPushSource = stubVectorPushSource{}
 			}
-			got := s.pgPushVectorSource(
-				config.PGConfig{PushVectors: tt.pushFlag}, tt.noVectors,
+			got := s.replicaPushVectorSource(
+				storage.ReplicaTarget{PushVectors: !tt.optOut}, tt.noVectors,
 			)
 			if tt.wantSrc {
 				assert.NotNil(t, got)
@@ -157,7 +159,11 @@ func missingEnvRef(tb testing.TB, name string) string {
 }
 
 func testServerWithConfig(cfg config.Config) *Server {
-	return &Server{cfg: cfg}
+	return &Server{
+		cfg:      cfg,
+		replicas: []storage.Replica{postgres.Backend{}, clickhouse.Backend{}},
+		mirror:   duckdb.Mirror{},
+	}
 }
 
 func readOpenAPISpec(tb testing.TB, h http.Handler) openAPISpec {
@@ -200,40 +206,50 @@ func TestPGPushConfigRequestOverrideSkipsDaemonEnvResolution(t *testing.T) {
 		PG: config.PGConfig{URL: missingEnvRef(t, envName)},
 	})
 	req := daemonPushRequest{
-		PG: &config.PGConfig{
+		Replica: &daemonReplicaTarget{
 			URL:         "postgres://user:pass@host/db",
 			Schema:      "mirror",
 			MachineName: "laptop",
 		},
 	}
 
-	got, err := s.pgPushConfig(req)
+	got, err := s.replicaPushTarget(postgres.Backend{}, req)
 	require.NoError(t, err)
 	assert.Equal(t, "postgres://user:pass@host/db", got.URL)
 	assert.Equal(t, "mirror", got.Schema)
 	assert.Equal(t, "laptop", got.MachineName)
 }
 
-func TestClickHousePushConfigRequestOverride(t *testing.T) {
+func TestClickHousePushTargetRequestOverride(t *testing.T) {
 	s := testServerWithConfig(config.Config{
 		ClickHouse: config.ClickHouseConfig{URL: "clickhouse://from-config"},
 	})
-	got, err := s.clickHousePushConfig(daemonPushRequest{
-		ClickHouse: &config.ClickHouseConfig{
+	got, err := s.replicaPushTarget(clickhouse.Backend{}, daemonPushRequest{
+		Replica: &daemonReplicaTarget{
 			URL:         "clickhouse://from-request",
-			Database:    "mirrordb",
+			Schema:      "mirrordb",
 			MachineName: "laptop",
 		},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "clickhouse://from-request", got.URL)
-	assert.Equal(t, "mirrordb", got.Database)
+	assert.Equal(t, "mirrordb", got.Schema)
 	assert.Equal(t, "laptop", got.MachineName)
+}
+
+func TestClickHousePushTargetDefaultsToDaemonConfig(t *testing.T) {
+	s := testServerWithConfig(config.Config{
+		ClickHouse: config.ClickHouseConfig{URL: "clickhouse://from-config", Database: "agentsview"},
+	})
+	got, err := s.replicaPushTarget(clickhouse.Backend{}, daemonPushRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "clickhouse://from-config", got.URL)
+	assert.Equal(t, "agentsview", got.Schema)
 }
 
 func TestClickHousePushRejectsIncludeAndExcludeProjects(t *testing.T) {
 	s := testServerWithConfig(config.Config{})
-	_, err := s.humaClickHousePush(t.Context(), &daemonPushInput{
+	_, err := s.humaReplicaPush(t.Context(), clickhouse.Backend{}, &daemonPushInput{
 		Body: daemonPushRequest{
 			Projects:        []string{"alpha"},
 			ExcludeProjects: []string{"beta"},
@@ -243,13 +259,13 @@ func TestClickHousePushRejectsIncludeAndExcludeProjects(t *testing.T) {
 	var statusErr interface{ GetStatus() int }
 	require.ErrorAs(t, err, &statusErr)
 	assert.Equal(t, http.StatusBadRequest, statusErr.GetStatus())
-	assert.Contains(t, err.Error(), "projects and exclude_projects cannot both be set")
+	assert.Contains(t, err.Error(), "projects and exclude_projects are mutually exclusive")
 }
 
 func TestPGPushRejectsIncludeAndExcludeProjects(t *testing.T) {
 	s := testServerWithConfig(config.Config{})
 
-	_, err := s.humaPGPush(t.Context(), &daemonPushInput{
+	_, err := s.humaReplicaPush(t.Context(), postgres.Backend{}, &daemonPushInput{
 		Body: daemonPushRequest{
 			Projects:        []string{"alpha"},
 			ExcludeProjects: []string{"beta"},
@@ -280,7 +296,7 @@ func TestPGPushEnsuresPricingAfterLocalSync(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/push/pg",
-		strings.NewReader(`{"full":false,"pg":{"url":"postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable","schema":"agentsview","machine_name":"test","allow_insecure":false}}`),
+		strings.NewReader(`{"full":false,"replica":{"url":"postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable","schema":"agentsview","machine_name":"test","allow_insecure":false}}`),
 	)
 	req.Host = "127.0.0.1:0"
 	req.RemoteAddr = "127.0.0.1:1234"
@@ -300,7 +316,7 @@ func TestPGPushEnsuresPricingAfterLocalSync(t *testing.T) {
 func TestDuckDBPushRejectsIncludeAndExcludeProjects(t *testing.T) {
 	s := testServerWithConfig(config.Config{})
 
-	_, err := s.humaDuckDBPush(t.Context(), &daemonPushInput{
+	_, err := s.humaMirrorPush(t.Context(), &daemonPushInput{
 		Body: daemonPushRequest{
 			Projects:        []string{"alpha"},
 			ExcludeProjects: []string{"beta"},
@@ -321,7 +337,7 @@ func TestDuckDBPushRejectsIncludeAndExcludeProjects(t *testing.T) {
 func TestDuckDBPushRejectsRemoteURLAsBadRequest(t *testing.T) {
 	s := testServer(t, 30)
 
-	_, err := s.humaDuckDBPush(t.Context(), &daemonPushInput{
+	_, err := s.humaMirrorPush(t.Context(), &daemonPushInput{
 		Body: daemonPushRequest{
 			DuckDB: &config.DuckDBConfig{
 				URL:         "quack:https://duck.example.test",
@@ -387,7 +403,7 @@ func TestDuckDBPushConfigPinsServerMirrorPath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := s.duckDBPushConfig(daemonPushRequest{DuckDB: tt.req})
+			got, err := s.mirrorPushConfig(daemonPushRequest{DuckDB: tt.req})
 			if tt.wantErrHas != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErrHas)
@@ -411,7 +427,7 @@ func TestDuckDBPushRejectsMismatchedMirrorPathAsBadRequest(t *testing.T) {
 		MachineName: "daemon",
 	}
 
-	_, err := s.humaDuckDBPush(t.Context(), &daemonPushInput{
+	_, err := s.humaMirrorPush(t.Context(), &daemonPushInput{
 		Body: daemonPushRequest{
 			DuckDB: &config.DuckDBConfig{
 				Path:        filepath.Join(t.TempDir(), "sessions.db"),
@@ -428,7 +444,7 @@ func TestDuckDBPushRejectsMismatchedMirrorPathAsBadRequest(t *testing.T) {
 }
 
 func TestDuckDBPushSyncOptionsPassesThroughProjectFilters(t *testing.T) {
-	got := duckDBPushSyncOptions(daemonPushRequest{
+	got := mirrorPushOptions(daemonPushRequest{
 		Projects:        []string{"alpha"},
 		ExcludeProjects: []string{"beta"},
 	})
@@ -619,8 +635,8 @@ func TestSyncThenRunForPushCopiesHealthyArchiveBesideCorruptSource(t *testing.T)
 			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/push/pg", nil)
 			request.Header.Set("Accept", accept)
 			hctx := humago.NewContext(&huma.Operation{}, request, recorder)
-			runPushStream(hctx, func(_ func(postgres.PushProgress)) (any, error) {
-				var result postgres.PushResult
+			runPushStream(hctx, func(_ func(storage.PushProgress)) (any, error) {
+				var result storage.PushResult
 				err := f.srv.syncThenRunForPush(t.Context(), engine, f.db, false, nil, nil,
 					func(forceFull bool) error {
 						assert.False(t, forceFull)
@@ -628,9 +644,9 @@ func TestSyncThenRunForPushCopiesHealthyArchiveBesideCorruptSource(t *testing.T)
 						require.NoError(t, err)
 						require.NotNil(t, session)
 						copied = append(copied, session.ID)
-						result = postgres.PushResult{
+						result = storage.PushResult{
 							SessionsPushed: 1, Errors: 2,
-							Vectors: postgres.VectorPushResult{SessionsDeferred: 3},
+							Vectors: storage.VectorPushResult{SessionsDeferred: 3},
 						}
 						return nil
 					})
@@ -643,7 +659,7 @@ func TestSyncThenRunForPushCopiesHealthyArchiveBesideCorruptSource(t *testing.T)
 				require.Contains(t, payload, "event: done\n")
 				_, payload, _ = strings.Cut(payload, "data: ")
 			}
-			var result postgres.PushResult
+			var result storage.PushResult
 			require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(payload)), &result))
 			assert.Equal(t, 1, result.SessionsPushed)
 			assert.Equal(t, 2, result.Errors, "row failures must reach the push client")
@@ -762,7 +778,7 @@ func TestPGPushRejectsMalformedWatchScopeBeforeSSE(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.body["full"] = false
-			tt.body["pg"] = map[string]any{
+			tt.body["replica"] = map[string]any{
 				"url":            "postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable",
 				"schema":         "agentsview",
 				"machine_name":   "test",
@@ -845,7 +861,7 @@ func TestPGPushRejectsWatchPathsOutsideStartupProviderRoots(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.body["full"] = false
-			tt.body["pg"] = map[string]any{
+			tt.body["replica"] = map[string]any{
 				"url":            "postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable",
 				"schema":         "agentsview",
 				"machine_name":   "test",
@@ -896,7 +912,7 @@ func TestPGPushFullRoutesResyncThroughWorkerRunner(t *testing.T) {
 	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/push/pg",
 		map[string]any{
 			"full": true,
-			"pg": map[string]any{
+			"replica": map[string]any{
 				"url":            "postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable",
 				"schema":         "agentsview",
 				"machine_name":   "test",
@@ -948,4 +964,50 @@ func TestValidatePushWatchScopeAcceptsAliasIndexWithoutEngine(t *testing.T) {
 			filepath.Join(base, "profile", parser.CodexSessionIndexFilename),
 		}},
 	}, cfg))
+}
+
+// TestReplicaPushTargetOmittedPushVectorsDefaultsOn pins the wire default:
+// a delegated push that leaves push_vectors out keeps the vector phase on,
+// matching the [pg] config default, while an explicit false still opts out.
+func TestReplicaPushTargetOmittedPushVectorsDefaultsOn(t *testing.T) {
+	s := testServerWithConfig(config.Config{})
+	for _, tt := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "omitted", body: `{"url":"postgres://h/db","machine_name":"m"}`, want: true},
+		{name: "explicit true", body: `{"url":"postgres://h/db","machine_name":"m","push_vectors":true}`, want: true},
+		{name: "explicit false", body: `{"url":"postgres://h/db","machine_name":"m","push_vectors":false}`, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var wire daemonReplicaTarget
+			require.NoError(t, json.Unmarshal([]byte(tt.body), &wire))
+			got, err := s.replicaPushTarget(postgres.Backend{}, daemonPushRequest{Replica: &wire})
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.PushVectors)
+		})
+	}
+}
+
+// TestClickHousePushRejectsPlaintextTargetBeforeStream pins that a ClickHouse
+// target the backend refuses (plaintext to a non-loopback host without
+// allow_insecure) fails with a 400 from the handler, before the stream opens
+// and before any local sync pass runs.
+func TestClickHousePushRejectsPlaintextTargetBeforeStream(t *testing.T) {
+	s := testServer(t, 30*time.Second)
+	_, err := s.humaReplicaPush(t.Context(), clickhouse.Backend{}, &daemonPushInput{
+		Body: daemonPushRequest{
+			Replica: &daemonReplicaTarget{
+				URL:         "clickhouse://user:pw@ch.example.test:9000/agentsview",
+				Schema:      "agentsview",
+				MachineName: "laptop",
+			},
+		},
+	})
+	require.Error(t, err)
+	var statusErr interface{ GetStatus() int }
+	require.ErrorAs(t, err, &statusErr)
+	assert.Equal(t, http.StatusBadRequest, statusErr.GetStatus())
+	assert.Contains(t, err.Error(), "allow_insecure")
 }

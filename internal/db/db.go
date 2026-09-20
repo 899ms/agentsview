@@ -503,7 +503,12 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // sessions in usage deduplication; a fingerprint change cannot cover this
 // because the source bytes are unchanged, so existing sessions need
 // re-parsing.)
-const dataVersion = 111
+// (112: Codex `originator=codex_exec` is persisted as session_kind
+// non-interactive so every exec session classifies as automated.
+// `thread_source=roborev` is persisted as session_kind roborev so roborev
+// reviews stay identifiable as code review. Existing Codex-format rows
+// need re-parsing.)
+const dataVersion = 112
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

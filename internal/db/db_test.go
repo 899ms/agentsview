@@ -1079,6 +1079,11 @@ func TestCurrentDataVersionCodexGuardianLineage(t *testing.T) {
 		"version 100 is the data-version boundary for Codex guardian lineage")
 }
 
+func TestCurrentDataVersionCodexExecSessionKind(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 112,
+		"version 112 is the data-version boundary for Codex exec and roborev session kinds")
+}
+
 func TestCurrentDataVersionCursorTurnTimestamps(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 101,
 		"Cursor turn timestamps require re-parsing existing sessions")

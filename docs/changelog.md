@@ -92,6 +92,16 @@ Release notes for
 - Profile `export sessions`, `export hour`, `export day`, and `export digest`
   with `--cpuprofile`, `--memprofile`, and `--trace`.
 
+**Improvements**
+
+- The Activity report served from ClickHouse returns the same results with far
+    less database work. Usage tokens are read from stored columns instead of
+    parsed JSON, tool events are paired per session, and candidate sessions are
+    sent once as native data. The first push or serve after upgrading fills the
+    new derived tables before serving and resumes if interrupted; a read-only
+    serve role reports the pending fill until a push with a capable role
+    finishes it.
+
 **Bug fixes**
 
 - Devin usage totals no longer discard messages from different sessions that

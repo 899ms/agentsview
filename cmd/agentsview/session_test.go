@@ -1190,6 +1190,83 @@ func TestSessionExportHermesStateDBWithoutSourceVersion(t *testing.T) {
 	assert.NotContains(t, out, "sibling hermes message")
 }
 
+func TestSessionExportAugureDesktopStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	virtualPath := dbPath + "#child"
+
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.SourceSessionID = "child"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.NoError(t, err)
+	// The selected session's JSONL must stream, not the SQLite file.
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+}
+
+func TestSessionExportAugureDesktopStateDBWithoutSourceSessionID(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	virtualPath := dbPath + "#child"
+
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.FilePath = &virtualPath
+		})
+
+	// SourceSessionID is empty, so the raw ID is derived from the
+	// augure-desktop: prefix.
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+}
+
+func TestSessionExportAugureDesktopDoesNotFallBackToHermesRoots(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dataDir, "config.toml"),
+		[]byte("augure_desktop_dirs = []\n"), 0o600,
+	))
+
+	// A Hermes store holds a session with the same raw ID as the fork's.
+	hermesRoot := t.TempDir()
+	_ = createHermesExportStateDB(t, hermesRoot)
+	t.Setenv("HERMES_SESSIONS_DIR", filepath.Join(hermesRoot, "sessions"))
+
+	// The fork's stored state.db is gone, so only a root search could
+	// resolve the session.
+	virtualPath := filepath.Join(t.TempDir(), "state.db") + "#child"
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.SourceSessionID = "child"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source file not found")
+	assert.NotContains(t, out, "target hermes message")
+}
+
 func TestSessionExport_AiderVirtualPathStreamsOnlySelectedRun(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 

@@ -1,4 +1,5 @@
 import { m } from "../i18n/index.js";
+import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
 import type { UsagePairwiseDimension } from "../api/types/usage.js";
 import {
   UsageService,
@@ -6,7 +7,7 @@ import {
   type ServiceUsagePairwiseComparisonResponse,
   type UsageSummaryResponse,
 } from "../api/generated/index";
-import { ApiError, isAbortError } from "../api/runtime.js";
+import { ApiError, isAbortError, responseTimingOf } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
@@ -15,6 +16,17 @@ import { ALL_TOKEN_TYPES, canonicalTokenTypes, type UsageTokenType } from "./usa
 type UsageParams = NonNullable<Parameters<typeof UsageService.getApiV1UsageSummary>[0]>;
 type UsagePairwiseParams = Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
 type UsagePanel = "summary" | "comparison" | "pairwise" | "topSessions";
+// Steps of a full refresh in execution order; the breakdown follows it. The
+// window summary is the second summary request made while a time range is
+// selected on the chart.
+type UsageStep = UsagePanel | "contextSummary";
+const USAGE_STEP_ORDER: readonly UsageStep[] = [
+  "summary",
+  "contextSummary",
+  "topSessions",
+  "comparison",
+  "pairwise",
+];
 type FetchResult = "ok" | "error" | "aborted";
 type FetchAllOptions = {
   preserveTimeRange?: boolean;
@@ -345,6 +357,16 @@ class UsageStore {
   pairwiseSelection = $state<UsagePairwiseSelection>(emptyPairwiseSelection());
   topSessions = $state<DbTopSessionEntry[] | null>(null);
   lastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent full refresh, request start to data
+  // applied, shown next to the refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  // Per-panel timings behind lastQueryDurationMs, in execution order.
+  lastQuerySteps: QueryStep[] = $state([]);
+  // Latest successful timing per panel, collected while a full refresh runs
+  // and snapshotted into lastQuerySteps when it completes. Offsets are
+  // relative to refreshStartedAt.
+  private stepTimings = new Map<UsageStep, QueryStep>();
+  private refreshStartedAt = 0;
   hasNewData: boolean = $state(false);
 
   loading = $state({
@@ -806,6 +828,9 @@ class UsageStore {
   }
 
   private async fetchAllWithResult(options: FetchAllOptions = {}): Promise<FetchResult> {
+    const startedAt = performance.now();
+    this.stepTimings.clear();
+    this.refreshStartedAt = startedAt;
     const selectedRangeAtStart = this.selectedTimeRange ? { ...this.selectedTimeRange } : null;
     if (!options.preserveTimeRange && this.selectedTimeRange !== null) {
       this.selectedTimeRange = null;
@@ -870,7 +895,7 @@ class UsageStore {
       comparisonResult === "ok" &&
       pairwiseResult === "ok"
     ) {
-      this.markRefreshComplete();
+      this.markRefreshComplete(startedAt);
       return "ok";
     }
     if (
@@ -923,6 +948,17 @@ class UsageStore {
       }
       if (this.versions.summary === v) {
         this.summary = data;
+        // Both responses are applied together, so each request's apply
+        // phase starts once the later body has arrived; the earlier one
+        // shows a gap while it waited for its sibling.
+        const bodies = [data, contextData]
+          .map((body) => responseTimingOf(body)?.bodyAt)
+          .filter((at): at is number => at !== undefined);
+        const applyStartedAt = bodies.length > 0 ? Math.max(...bodies) : undefined;
+        this.noteStep("summary", started, data, applyStartedAt);
+        if (contextData !== null) {
+          this.noteStep("contextSummary", started, contextData, applyStartedAt);
+        }
         this.isTimeRangeSummaryProvisional = false;
         if (contextData !== null) {
           this.timeSeriesContextSummary = contextData;
@@ -996,12 +1032,7 @@ class UsageStore {
         }
       }
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "summary",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("summary", started, status);
       this.clearAbortSignal("summary", signal);
       if (this.versions.summary === v) {
         this.loading.summary = false;
@@ -1029,6 +1060,7 @@ class UsageStore {
       );
       if (this.versions.summary === summaryVersion) {
         this.summary = { ...summary, comparison };
+        this.noteStep("comparison", started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1043,12 +1075,7 @@ class UsageStore {
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "comparison",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("comparison", started, status);
       this.clearAbortSignal("comparison", signal);
     }
   }
@@ -1089,6 +1116,7 @@ class UsageStore {
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.pairwiseComparison = comparison;
         this.errors.pairwise = null;
+        this.noteStep("pairwise", started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1107,12 +1135,7 @@ class UsageStore {
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "pairwise",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("pairwise", started, status);
       this.clearAbortSignal("pairwise", signal);
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.loading.pairwise = false;
@@ -1143,6 +1166,7 @@ class UsageStore {
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
+        this.noteStep("topSessions", started, data);
         return "ok";
       }
       return "aborted";
@@ -1161,12 +1185,7 @@ class UsageStore {
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "topSessions",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("topSessions", started, status);
       this.clearAbortSignal("topSessions", signal);
       if (this.versions.topSessions === v) {
         this.loading.topSessions = false;
@@ -1220,9 +1239,45 @@ class UsageStore {
     this.loading.topSessions = false;
   }
 
-  private markRefreshComplete(): void {
+  private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
+    this.lastQueryDurationMs = performance.now() - startedAt;
+    this.lastQuerySteps = USAGE_STEP_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
     this.hasNewData = false;
+  }
+
+  private recordStep(
+    panel: UsagePanel,
+    startedAt: number,
+    status: "ok" | "error" | "aborted",
+  ): void {
+    perf.recordPanel({
+      route: "usage",
+      name: panel,
+      durationMs: performance.now() - startedAt,
+      status,
+    });
+  }
+
+  // Called once a request's data is applied: the step spans request sent to
+  // data applied and carries the request's wait/download/apply phases.
+  private noteStep(
+    step: UsageStep,
+    startedAt: number,
+    data: unknown,
+    applyStartedAt?: number,
+  ): void {
+    this.stepTimings.set(
+      step,
+      queryStepFrom(
+        step,
+        responseTimingOf(data),
+        startedAt,
+        performance.now(),
+        this.refreshStartedAt,
+        applyStartedAt,
+      ),
+    );
   }
 }
 

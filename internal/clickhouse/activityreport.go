@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -26,8 +27,8 @@ var (
 // of the resolved range `q` as RFC3339 strings. ClickHouse compares parsed
 // instants, so the zone suffix stays, matching DuckDB and PostgreSQL.
 func activityReportRangeBoundsUTC(q activity.Query) (string, string) {
-	return q.RangeStart.UTC().Format(time.RFC3339),
-		q.RangeEnd.UTC().Format(time.RFC3339)
+	return q.RangeStart.UTC().Format(time.RFC3339Nano),
+		q.RangeEnd.UTC().Format(time.RFC3339Nano)
 }
 
 // GetActivityReport assembles a concurrency- and usage-oriented report
@@ -60,8 +61,6 @@ func (s *Store) BuildActivityReportArtifacts(
 	f.IncludeSubagents = true
 	f.IncludeForks = true
 	rangeStartUTC, rangeEndUTC := activityReportRangeBoundsUTC(q)
-	lowerBound := chUsagePaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
-	upperBound := chUsagePaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
 
 	candidateWhere, candidateArgs := clickActivityReportCandidateWhere(
 		f, rangeStartUTC, rangeEndUTC)
@@ -86,7 +85,7 @@ func (s *Store) BuildActivityReportArtifacts(
 	})
 
 	usage, pricing, err := s.activityReportUsage(
-		ctx, candidates, ids, lowerBound, upperBound, q)
+		ctx, candidates, ids, rangeStartUTC, rangeEndUTC, q)
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
 	}
@@ -475,8 +474,13 @@ func (s *Store) activityReportUsage(
 		return nil, nil, err
 	}
 
-	sort.SliceStable(rowsAcc, func(i, j int) bool {
-		a, b := rowsAcc[i], rowsAcc[j]
+	// Keep the wide scanned rows in place while ordering their indexes.
+	order := make([]int, len(rowsAcc))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := &rowsAcc[order[i]], &rowsAcc[order[j]]
 		if a.validTS && b.validTS && !a.ts.Equal(b.ts) {
 			return a.ts.Before(b.ts)
 		}
@@ -486,7 +490,8 @@ func (s *Store) activityReportUsage(
 		return a.ordinal < b.ordinal
 	})
 	baseRows := make([]activity.UsageRow, len(rowsAcc))
-	for i, o := range rowsAcc {
+	for i, index := range order {
+		o := &rowsAcc[index]
 		baseRows[i] = activity.UsageRow{
 			SessionID:         o.scan.sessionID,
 			Model:             o.scan.model,
@@ -505,7 +510,8 @@ func (s *Store) activityReportUsage(
 		q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
 	)
 	out = make([]activity.UsageRow, 0, len(rowsAcc))
-	for i, o := range rowsAcc {
+	for i, index := range order {
+		o := &rowsAcc[index]
 		if !mask[i] {
 			continue
 		}
@@ -541,14 +547,9 @@ func (s *Store) activityReportUsage(
 	return out, &block, nil
 }
 
-// clickActivityReportUsageQuery builds the activity report usage statement.
-// candidate_sessions evaluates the report's session predicate,
-// candidate_snapshot_keys collects the distinct Claude (message_id,
-// request_id) pairs those sessions carry inside the padded bounds, and the
-// message branch keeps a row when its session is a candidate or its pair
-// matches one of those keys. Rows from non-candidate sessions are the peers
-// the survivor selection compares against; it never attributes them to the
-// report unless the earliest snapshot belongs to a candidate.
+// clickActivityReportUsageQuery reads candidate usage and any peers needed
+// for complete-snapshot selection. Key discovery may include obsolete keys:
+// a peer-only group cannot survive attribution to the candidate sessions.
 func clickActivityReportUsageQuery(
 	candidates chSessionSet, lowerBound, upperBound string,
 ) (string, []any) {
@@ -556,42 +557,35 @@ func clickActivityReportUsageQuery(
 		" AND COALESCE(m.timestamp, s.started_at) <= " + chTimestampSQL
 	eventBound := " AND COALESCE(ue.occurred_at, s.started_at) >= " + chTimestampSQL +
 		" AND COALESCE(ue.occurred_at, s.started_at) <= " + chTimestampSQL
+	timestampBound := "(m.timestamp IS NULL OR (m.timestamp >= " + chTimestampSQL +
+		" AND m.timestamp <= " + chTimestampSQL + "))"
 	const candidateIn = "s.id IN (SELECT id FROM candidate_sessions)"
-	// Read keys without FINAL so the time index can prune old parts. The outer
-	// read still resolves replacements and checks the current timestamp.
-	const boundedKeys = "(m.session_id, m.ordinal) IN (SELECT session_id, ordinal FROM bounded_usage_keys)"
-	ctes := `bounded_usage_keys AS (
-			SELECT session_id, ordinal FROM usage_messages
-			WHERE timestamp IS NULL OR (timestamp >= ` + chTimestampSQL + ` AND timestamp <= ` + chTimestampSQL + `)
-			SETTINGS final = 0
-		), candidate_sessions AS (
+	ctes := `candidate_sessions AS (
 			SELECT id FROM (` + candidates.body + `)
-		),
-		candidate_snapshot_keys AS (
+		), candidate_snapshot_keys AS (
 			SELECT DISTINCT m.claude_message_id AS claude_message_id,
 				m.claude_request_id AS claude_request_id
 			FROM usage_messages m
-			JOIN sessions s ON s.id = m.session_id
-			WHERE ` + chUsageMessageCurrent + " AND " + boundedKeys + " AND " + chUsageStoredMessageEligibility + `
-				AND ` + candidateIn + `
-				AND m.claude_message_id != ''
-				AND m.claude_request_id != ''` + messageBound + `
-		),
-		`
-	// Keep both OR branches on messages so ClickHouse can filter before the join.
+			WHERE m.session_id IN (SELECT id FROM candidate_sessions)
+				AND m.claude_message_id != '' AND m.claude_request_id != ''
+				AND ` + timestampBound + `
+			SETTINGS final = 0
+		), `
 	query := clickUsageNormalizedQueryWith(ctes,
-		boundedKeys+" AND "+chUsageStoredMessageEligibility+`
+		timestampBound+" AND "+chUsageStoredMessageEligibility+`
 			AND (m.session_id IN (SELECT id FROM candidate_sessions)
 				OR (m.claude_message_id, m.claude_request_id) IN (
 					SELECT claude_message_id, claude_request_id
 					FROM candidate_snapshot_keys))`+messageBound,
 		chUsageEventEligibility+" AND "+candidateIn+eventBound,
 	)
-	args := append([]any{lowerBound, upperBound}, candidates.args...)
-	args = append(args, lowerBound, upperBound)
-	args = append(args, lowerBound, upperBound)
-	args = append(args, lowerBound, upperBound)
-	return query + " SETTINGS optimize_move_to_prewhere_if_final = 0", args
+	args := slices.Clone(candidates.args)
+	for range 4 {
+		args = append(args, lowerBound, upperBound)
+	}
+	// Exact index filtering also reads overlapping newer parts before FINAL.
+	// A timestamp correction must not resurrect an older matching version.
+	return query + " SETTINGS optimize_move_to_prewhere_if_final = 0, use_skip_indexes_if_final_exact_mode = 1", args
 }
 
 // A push writes a session's messages before it publishes the session row, and
@@ -744,7 +738,9 @@ func (s *Store) scanActivityUsageRows(
 		return nil, fmt.Errorf("querying clickhouse activity usage: %w", err)
 	}
 	defer rows.Close()
-	var rowsAcc []clickSessionUsageOrderedRow
+	// Start non-nil: the caller indexes the result through a sorted index
+	// slice, and NilAway cannot see that an empty result yields no indexes.
+	rowsAcc := make([]clickSessionUsageOrderedRow, 0)
 	for rows.Next() {
 		var r clickActivityReportUsageRow
 		var ts, pricingTS any
@@ -852,10 +848,10 @@ func clickActivityReportRowStatus(
 	r clickActivityReportUsageRow, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
 	canonicalModel := chUsageLookupModel(r.model, r.pricingTS)
-	pricedModel, lookup := pricing.ResolveAt(
-		r.model, canonicalModel, chUsagePricingTimestamp(r.pricingTS),
-	)
 	if r.cost.Valid {
+		pricedModel, lookup := pricing.ResolveAt(
+			r.model, canonicalModel, chUsagePricingTimestamp(r.pricingTS),
+		)
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
@@ -865,6 +861,11 @@ func clickActivityReportRowStatus(
 	) {
 		return money.Money{}, true, false, nil
 	}
+	pricedModel, lookup, err := pricing.ResolveBilledAt(
+		r.providerID, r.model, canonicalModel, chUsagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
 	if !lookup.OK {
 		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
 		fee, feeErr := export.WebSearchFee(r.webSearchRequests)
@@ -872,11 +873,6 @@ func clickActivityReportRowStatus(
 			return money.Money{}, false, false, feeErr
 		}
 		return fee, false, true, nil
-	}
-	pricedModel, lookup, err = pricing.ResolveBilledAt(
-		r.providerID, r.model, canonicalModel, chUsagePricingTimestamp(r.pricingTS))
-	if err != nil {
-		return money.Money{}, false, false, err
 	}
 	requestScoped := db.UsageSourceIsRequestScoped(r.source) || r.messageOrdinal.Valid
 	cost, err = lookup.Rates.CostForTokensScoped(

@@ -594,7 +594,9 @@ func (s *Sync) pushSessionBatch(
 	}
 	for batchIDs := range idBatches(ids) {
 		placeholders, args := inArgs(batchIDs)
-		for _, table := range dependentTables {
+		// The usage_messages view never sees deletes, so a shorter republished
+		// session would leave its removed ordinals behind at the old version.
+		for _, table := range slices.Concat(dependentTables, []string{"usage_messages"}) {
 			if _, err := s.conn.ExecContext(ctx,
 				"DELETE FROM "+table+" WHERE session_id IN ("+placeholders+") AND push_version < ?",
 				append(args, version)...); err != nil {

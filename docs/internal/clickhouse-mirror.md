@@ -68,7 +68,9 @@ transactions. Per batch of changed sessions, with `v` this push's version:
 1. Insert dependent rows (messages, tool calls, result events, usage, findings,
    pins).
 1. `DELETE ... WHERE session_id IN (...) AND push_version < v` per dependent
-   table.
+   table and for `usage_messages`. Its materialized view never sees deletes,
+   so a shorter republished session would otherwise leave obsolete usage rows
+   in the mirror.
 1. Insert session rows with fingerprint and `source_archive_id`.
 
 A crash before step 3 leaves the fingerprint stale, so the next push re-selects
@@ -81,8 +83,8 @@ DuckDB SQL stay byte-identical. ClickHouse uses `UNION ALL` in recursive CTEs,
 `parent_session_id IS NULL OR NOT IN (SELECT id FROM sessions)` for orphans
 (`NULL NOT IN (...)` is unknown and would hide NULL-parent rows), `ILIKE` with
 the default backslash escape and no `ESCAPE` clause (ESCAPE landed in 26.6; the
-pin is 25.8), and `toStartOfDay` / `toStartOfWeek` / `toStartOfMonth` instead of
-`date_trunc`.
+mirror was written against 25.8), and `toStartOfDay` / `toStartOfWeek` /
+`toStartOfMonth` instead of `date_trunc`.
 
 **Bootstrap through `default`.** `OpenForAdmin` pings the server `default`
 database, then `CREATE DATABASE IF NOT EXISTS` the mirror name. Pinging the
@@ -185,6 +187,20 @@ so an interrupted startup repeats the fill without touching source tables. A
 read-only role cannot run the fill and fails the compatibility check until a
 capable push completes it.
 
+**Freshness is checked from part metadata.** Every report request first asks
+whether the mirror changed. That source probe used to scan `sessions`,
+`messages`, `usage_events`, both pricing tables, and `sync_metadata` for their
+counts and maxima on every request. The store now hashes the active
+`system.parts` rows of those six tables, which is metadata and reads no data,
+and reuses the last probe result while the hash is unchanged. A merge changes
+the parts without changing the data, so the hash is never the report token: on a
+hash miss the store recomputes the original probe and caches it under the new
+hash, and only a real data change moves the token or resets pagination. The
+mutex protects only the cached pair, never a query, and an error is not cached.
+This is whole-mirror invalidation; any insert, delete, or merge on one of those
+tables triggers one full probe. Reading `system.parts` needs its own grant,
+described in [ClickHouse sync](../clickhouse-sync.md#3-serve-the-dashboard).
+
 ## Tradeoffs
 
 Push copies stars and pins from SQLite, but the ClickHouse UI cannot change
@@ -201,5 +217,5 @@ hides the stale ones from readers.
 
 Unit tests cover dialect rendering, config, TLS checks, and fingerprints.
 Integration tests use the `chtest` tag against
-`clickhouse/clickhouse-server:25.8` or `TEST_CLICKHOUSE_URL`.
+`clickhouse/clickhouse-server:26.8` or `TEST_CLICKHOUSE_URL`.
 `make test-clickhouse` is the suite. Do not point it at a live mirror.

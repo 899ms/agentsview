@@ -3,8 +3,22 @@ title: Changelog
 description: Release history for AgentsView
 ---
 
-Release notes for
+The latest published release is
 [0.44.0](https://github.com/kenn-io/agentsview/releases/tag/v0.44.0).
+
+## Unreleased
+
+**New features**
+
+- Coding agents can now consult prior conversation evidence proactively when
+  earlier decisions or solutions may help. `agentsview skills install`
+  upgrades the existing recall skill for Claude and Agents/Codex, and Claude
+  also receives a bounded `agentsview-search-conversations` agent. That agent
+  can call only `mcp__agentsview__search_content` and
+  `mcp__agentsview__get_messages`, so a transcript cannot invoke built-in tools
+  or tools from any other MCP server. Register the AgentsView MCP server as
+  `agentsview`. Every generated artifact is listed and protected independently
+  from local edits.
 
 ## 0.44.0
 

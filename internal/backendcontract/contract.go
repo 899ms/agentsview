@@ -33,6 +33,14 @@ var (
 	_ storage.ReplicaStore = (*clickhousestore.Store)(nil)
 )
 
+// Replicas that serve semantic search over pushed embeddings.
+var (
+	_ storage.VectorSearchProvider = postgresstore.Backend{}
+	_ storage.VectorSearchStore    = (*postgresstore.Store)(nil)
+	_ storage.VectorSearchProvider = clickhousestore.Backend{}
+	_ storage.VectorSearchStore    = (*clickhousestore.Store)(nil)
+)
+
 // Derived mirror: local rebuild and Quack serve.
 var _ storage.Mirror = duckdbstore.Mirror{}
 

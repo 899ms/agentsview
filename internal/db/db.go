@@ -4628,11 +4628,30 @@ func (db *DB) RebuildFTS(ctx context.Context) error {
 	return nil
 }
 
+// bulkImportWALAutocheckpointBytes is the WAL growth between automatic
+// checkpoints in a disposable resync archive. Tests shrink it.
+var bulkImportWALAutocheckpointBytes = 128 << 20
+
+func bulkImportWALAutocheckpointPages(pageSize int) int {
+	return max(1, bulkImportWALAutocheckpointBytes/pageSize)
+}
+
 // DropBulkImportIndexes omits derived index maintenance in a disposable
-// full-resync archive. RebuildBulkImportIndexes must succeed before the swap.
+// full-resync archive and defers its automatic WAL checkpoints.
+// RebuildBulkImportIndexes and CheckpointWALTruncate must succeed before the swap.
 func (db *DB) DropBulkImportIndexes(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	w := db.getWriter()
+	var pageSize int
+	if err := w.QueryRow(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("reading page_size: %w", err)
+	}
+	// This policy belongs to the disposable writer connection and ends on close.
+	if _, err := w.Exec(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d",
+		bulkImportWALAutocheckpointPages(pageSize))); err != nil {
+		return fmt.Errorf("setting wal_autocheckpoint: %w", err)
+	}
 	for _, name := range []string{
 		"idx_messages_usage_timestamp",
 		"idx_messages_usage_session_covering",
@@ -4641,7 +4660,7 @@ func (db *DB) DropBulkImportIndexes(ctx context.Context) error {
 		"idx_tool_result_events_identity",
 		"idx_tool_result_events_summary",
 	} {
-		if _, err := db.getWriter().Exec(ctx, `DROP INDEX IF EXISTS `+name); err != nil {
+		if _, err := w.Exec(ctx, `DROP INDEX IF EXISTS `+name); err != nil {
 			return fmt.Errorf("dropping bulk import index %s: %w", name, err)
 		}
 	}
